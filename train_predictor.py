@@ -9,6 +9,9 @@ is to beat them):
   copy_last : repeat the last context step for every future step
   linear    : extrapolate last + (last - prev) * k
   mean      : mean of all context steps
+Also reported (stricter, not part of the official criterion):
+  copy_clip : tgt[k] = ctx[k], i.e. replay the context clip step by step
+              (V-JEPA 2 features carry a within-clip time-position signal)
 
 One GPU : python train_predictor.py --features feats
 Two GPUs: torchrun --nproc_per_node=2 train_predictor.py --features feats
@@ -80,24 +83,26 @@ class Predictor(nn.Module):
 def baselines(ctx, t_tgt):
     last, prev = ctx[:, -1:], ctx[:, -2:-1]
     k = torch.arange(1, t_tgt + 1, device=ctx.device).view(1, -1, 1, 1).float()
-    return {
+    out = {
         "copy_last": last.expand(-1, t_tgt, -1, -1),
         "linear": last + (last - prev) * k,
         "mean": ctx.mean(1, keepdim=True).expand(-1, t_tgt, -1, -1),
     }
+    if ctx.shape[1] == t_tgt:
+        out["copy_clip"] = ctx
+    return out
 
 
 @torch.no_grad()
 def evaluate(model, loader, device, norm):
     model.eval()
-    tot = {"predictor": 0.0, "copy_last": 0.0, "linear": 0.0, "mean": 0.0}
-    cos = {"predictor": 0.0, "copy_last": 0.0}
+    tot, cos = {}, {"predictor": 0.0, "copy_last": 0.0}
     n = 0
     for c, t in loader:
         c, t = norm(c.to(device)), norm(t.to(device))
         preds = {"predictor": model(c), **baselines(c, t.shape[1])}
         for k, p in preds.items():
-            tot[k] += F.l1_loss(p, t, reduction="sum").item() / t[0].numel()
+            tot[k] = tot.get(k, 0.0) + F.l1_loss(p, t, reduction="sum").item() / t[0].numel()
             if k in cos:
                 cos[k] += F.cosine_similarity(p, t, dim=-1).mean(dim=(1, 2)).sum().item()
         n += c.shape[0]
@@ -192,10 +197,13 @@ def main():
         res.update(epoch=ep, train_l1=run / len(train_dl))
         history.append(res)
         beats = res["l1/predictor"] < min(res["l1/copy_last"], res["l1/linear"], res["l1/mean"])
+        clip = res.get("l1/copy_clip")
         print(
             f"ep {ep:02d} train {res['train_l1']:.4f} | val predictor {res['l1/predictor']:.4f} "
             f"copy_last {res['l1/copy_last']:.4f} linear {res['l1/linear']:.4f} mean {res['l1/mean']:.4f} "
-            f"| cos {res['cos/predictor']:.3f} vs {res['cos/copy_last']:.3f} {'BEATS' if beats else ''}",
+            + (f"copy_clip {clip:.4f} " if clip is not None else "")
+            + f"| cos {res['cos/predictor']:.3f} vs {res['cos/copy_last']:.3f} {'BEATS' if beats else ''}"
+            + ("+clip" if beats and clip is not None and res["l1/predictor"] < clip else ""),
             flush=True,
         )
         if res["l1/predictor"] < best:
