@@ -10,11 +10,17 @@ are fed back until it answers. `llm(messages, tools)` must return either
 Backends:
   OfflineLLM : no API. Rule-based stand-in (attribute word matching) used to
                test the whole loop for free and as a baseline for the real model.
-  Muse Spark : added once the endpoint is known. The API key is read from an
-               environment variable only; it is never written to code or logs.
+  ChatLLM    : any OpenAI-compatible /chat/completions endpoint with tool calling
+               (Muse Spark). Base URL and model from --base-url/--model or
+               META_BASE_URL/META_MODEL; the API key is read from META_API_KEY only
+               and is never written to code or logs.
 """
 import json
+import os
 import re
+import time
+import urllib.error
+import urllib.request
 
 from agent_tools import TOOLS, run_tool
 
@@ -73,20 +79,74 @@ class OfflineLLM:
         return {"content": "\n".join(lines)}
 
 
+class ChatLLM:
+    """OpenAI-compatible chat backend. Counts tokens so a run can report (and cap) its cost."""
+
+    def __init__(self, base_url=None, model=None, key_env="META_API_KEY"):
+        self.url = (base_url or os.environ["META_BASE_URL"]).rstrip("/") + "/chat/completions"
+        self.model = model or os.environ["META_MODEL"]
+        self.key = os.environ[key_env]
+        self.tokens_in = self.tokens_out = 0
+
+    @staticmethod
+    def _wire(m):
+        if m["role"] == "assistant" and "tool_calls" in m:
+            return {"role": "assistant", "content": None, "tool_calls": [
+                {"id": c["id"], "type": "function",
+                 "function": {"name": c["name"], "arguments": json.dumps(c.get("arguments", {}))}}
+                for c in m["tool_calls"]]}
+        if m["role"] == "tool":
+            return {"role": "tool", "tool_call_id": m["tool_call_id"], "content": m["content"]}
+        return m
+
+    def _post(self, body, retries=3):
+        req = urllib.request.Request(self.url, json.dumps(body).encode(), {
+            "Content-Type": "application/json", "Authorization": f"Bearer {self.key}"})
+        for i in range(retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    return json.load(r)
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 500, 502, 503) and i < retries:
+                    time.sleep(2 ** i * 5)
+                    continue
+                raise RuntimeError(f"HTTP {e.code} from {self.url}: {e.read()[:500].decode(errors='replace')}")
+
+    def __call__(self, messages, tools):
+        out = self._post({"model": self.model, "temperature": 0,
+                          "messages": [self._wire(m) for m in messages],
+                          "tools": [{"type": "function", "function": t} for t in tools]})
+        usage = out.get("usage") or {}
+        self.tokens_in += usage.get("prompt_tokens", 0)
+        self.tokens_out += usage.get("completion_tokens", 0)
+        msg = out["choices"][0]["message"]
+        if msg.get("tool_calls"):
+            return {"tool_calls": [{"id": c["id"], "name": c["function"]["name"],
+                                    "arguments": json.loads(c["function"].get("arguments") or "{}")}
+                                   for c in msg["tool_calls"]]}
+        return {"content": msg.get("content") or ""}
+
+
 def answer(question, scene, llm, choices=None, max_steps=6, log=None):
     if choices:
         question += "\n" + "\n".join(f"{i}. {c}" for i, c in enumerate(choices))
     messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": question}]
-    for _ in range(max_steps):
+    for step in range(max_steps):
         out = llm(messages, TOOLS)
         if "tool_calls" not in out:
             if log is not None:
                 log.extend(messages + [{"role": "assistant", "content": out["content"]}])
             return out["content"]
+        for i, call in enumerate(out["tool_calls"]):
+            call.setdefault("id", f"call_{step}_{i}")
         messages.append({"role": "assistant", "tool_calls": out["tool_calls"]})
         for call in out["tool_calls"]:
-            res = run_tool(scene, call["name"], call.get("arguments", {}))
-            messages.append({"role": "tool", "name": call["name"], "content": json.dumps(res)})
+            try:
+                res = run_tool(scene, call["name"], call.get("arguments", {}))
+            except Exception as e:  # bad arguments from the model: tell it instead of crashing
+                res = {"error": f"{type(e).__name__}: {e}"}
+            messages.append({"role": "tool", "name": call["name"], "tool_call_id": call["id"],
+                             "content": json.dumps(res)})
     return ""
 
 
@@ -98,7 +158,6 @@ def parse_choices(text, n):
 
 if __name__ == "__main__":
     import argparse
-    import os
 
     from agent_tools import Scene
 
@@ -109,9 +168,19 @@ if __name__ == "__main__":
     ap.add_argument("--questions", default=os.path.expanduser("~/objectjepa_data/clevrer/questions/train.json"))
     ap.add_argument("--videos", required=True, help="text file with video names (use val videos)")
     ap.add_argument("--limit", type=int, default=0, help="max questions")
+    ap.add_argument("--backend", choices=["offline", "chat"], default="offline")
+    ap.add_argument("--base-url", default=None, help="chat backend (default $META_BASE_URL)")
+    ap.add_argument("--model", default=None, help="chat backend (default $META_MODEL)")
+    ap.add_argument("--price-in", type=float, default=1.25, help="USD per M input tokens")
+    ap.add_argument("--price-out", type=float, default=4.25, help="USD per M output tokens")
+    ap.add_argument("--max-usd", type=float, default=1.0, help="stop once the estimated cost exceeds this")
+    ap.add_argument("--log", default=None, help="write each question's messages to this .jsonl")
     args = ap.parse_args()
     qs = {q["video_filename"][:-4]: q for q in json.load(open(args.questions))}
-    llm, n_opt, ok_opt, n_q, ok_q = OfflineLLM(), 0, 0, 0, 0
+    llm = OfflineLLM() if args.backend == "offline" else ChatLLM(args.base_url, args.model)
+    cost = lambda: (getattr(llm, "tokens_in", 0) * args.price_in + getattr(llm, "tokens_out", 0) * args.price_out) / 1e6
+    logf = open(args.log, "w") if args.log else None
+    n_opt, ok_opt, n_q, ok_q = 0, 0, 0, 0
     for name in (l.strip() for l in open(args.videos)):
         if not os.path.exists(os.path.join(args.features, f"{name}.pt")) or name not in qs:
             continue
@@ -119,14 +188,23 @@ if __name__ == "__main__":
         for q in qs[name]["questions"]:
             if q["question_type"] != "counterfactual":
                 continue
-            got = parse_choices(answer(q["question"], scene, llm, [c["choice"] for c in q["choices"]]),
+            msgs = []
+            got = parse_choices(answer(q["question"], scene, llm, [c["choice"] for c in q["choices"]], log=msgs),
                                 len(q["choices"]))
             truth = [c["answer"] == "correct" for c in q["choices"]]
             ok = [g == t for g, t in zip(got, truth)]
             n_opt, ok_opt, n_q, ok_q = n_opt + len(ok), ok_opt + sum(ok), n_q + 1, ok_q + all(ok)
-            if args.limit and n_q >= args.limit:
+            if logf:
+                logf.write(json.dumps({"video": name, "question_id": q["question_id"], "truth": truth,
+                                       "got": got, "messages": msgs}) + "\n")
+                logf.flush()
+            if (args.limit and n_q >= args.limit) or cost() > args.max_usd:
                 break
-        if args.limit and n_q >= args.limit:
+        if (args.limit and n_q >= args.limit) or cost() > args.max_usd:
             break
-    print(f"agent (offline parser, {args.masks} masks): per-option {ok_opt / max(1, n_opt):.3f} "
+    label = "offline parser" if args.backend == "offline" else llm.model
+    print(f"agent ({label}, {args.masks} masks): per-option {ok_opt / max(1, n_opt):.3f} "
           f"per-question {ok_q / max(1, n_q):.3f} ({n_q} questions)")
+    if args.backend == "chat":
+        print(f"tokens in {llm.tokens_in}, out {llm.tokens_out}, estimated ${cost():.4f} "
+              f"(${args.price_in}/M in, ${args.price_out}/M out)" + ("  STOPPED at --max-usd" if cost() > args.max_usd else ""))
