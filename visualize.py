@@ -1,100 +1,242 @@
 """Demo video: object masks + actual vs predicted object paths (+ optional "what if").
 
 Frames 0-31 are observed (context). From frame 32 on, the object predictor rolls
-forward (whatif.rollout) and the video shows, for each object:
+forward (whatif.rollout) and the video shows, for each object (outline and label
+in the object's own colour):
   solid line  : actual centroid path (from the masks)
   dotted line : predicted path
-  with --remove: the removed object is greyed out and the dotted line is the
-  counterfactual path of the others; predicted collisions are marked.
+  star        : predicted collision
+  with --remove: the removed object is faded out of the frames with a dashed
+  outline, the dotted lines are the counterfactual paths of the others, and the
+  last frames show the answer of the what_if_remove tool (the one the agent uses).
 
-python visualize.py --video video_09770 --ckpt ckpt_obj --features obj_features --masks clevrer --out demo.mp4
+python visualize.py --video video_06926 --masks sam --features obj_features_sam --ckpt ckpt_obj --remove 2 --out demo.mp4
 """
 import argparse
 import os
+import textwrap
 
 import av
 import cv2
+import matplotlib
 import numpy as np
-import torch
+from PIL import Image, ImageDraw, ImageFont
 
+from agent_tools import Scene
 from extract_features import read_frames
-from extract_object_features import clevrer_masks, rle_decode, sam_masks
-from whatif import C, PATCH_PX, W_PX, H_PX, load_model, observed_tracks, rollout
+from extract_object_features import rle_decode
+from whatif import C, PATCH_PX, W_PX, H_PX, collisions, observed_tracks, rollout
 
-PALETTE = [(230, 25, 75), (60, 180, 75), (255, 225, 25), (0, 130, 200), (245, 130, 48),
-           (145, 30, 180), (70, 240, 240), (240, 50, 230)]
+# display colours for the CLEVRER colour names (brighter than the rendered ones, for outlines and labels)
+COLOURS = {"blue": (50, 115, 255), "brown": (190, 125, 60), "cyan": (0, 225, 225), "gray": (205, 205, 205),
+           "green": (70, 210, 80), "purple": (185, 95, 245), "red": (245, 60, 60), "yellow": (250, 225, 40)}
 STEP = 4  # frames per tubelet step
+CTX = 8  # observed steps (frames 0-31)
+SCALE = 2  # output is 2x the 480x320 CLEVRER frames, so the text stays readable
+BAR = 112  # height of the legend bar under the video
+MAX_JUMP = 60  # px per step; longer jumps in a mask track are detection glitches, not drawn as lines
+WHITE, DARK = (255, 255, 255), (24, 24, 28)
+
+
+def font(size, bold=False):
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    return ImageFont.truetype(os.path.join(matplotlib.get_data_path(), "fonts", "ttf", name), size)
+
+
+F_LABEL, F_TEXT, F_BOLD, F_BIG = font(15), font(17), font(19, True), font(24, True)
+
+
+def pt(p):
+    return tuple(int(round(v * SCALE)) for v in p)
 
 
 def draw_path(img, pts, color, dotted=False):
-    pts = [tuple(int(v) for v in p) for p in pts]
-    for a, b in zip(pts[:-1], pts[1:]):
-        if dotted:
-            cv2.circle(img, b, 4, (255, 255, 255), -1, cv2.LINE_AA)
-            cv2.circle(img, b, 3, color, -1, cv2.LINE_AA)
+    if not dotted:
+        for a, b in zip(pts[:-1], pts[1:]):
+            if np.linalg.norm(b - a) < MAX_JUMP:
+                cv2.line(img, pt(a), pt(b), color, 3, cv2.LINE_AA)
+        return
+    for p in pts[1:]:
+        cv2.circle(img, pt(p), 6, WHITE, -1, cv2.LINE_AA)
+        cv2.circle(img, pt(p), 4, color, -1, cv2.LINE_AA)
+
+
+def dashed(img, cnt, color, on=8, off=6):
+    p = cnt[:, 0] * SCALE
+    for i in range(0, len(p), on + off):
+        cv2.polylines(img, [p[i : i + on]], False, color, 3, cv2.LINE_AA)
+
+
+def fade_out(frame, mask, keep=0.3):
+    """Paint the floor over an object (inpainting), leaving a faint ghost."""
+    m = cv2.dilate(mask.astype(np.uint8), np.ones((7, 7), np.uint8))
+    inp = cv2.inpaint(frame, m, 5, cv2.INPAINT_TELEA)
+    out = frame.copy()
+    out[m > 0] = (keep * frame[m > 0] + (1 - keep) * inp[m > 0]).astype(np.uint8)
+    return out
+
+
+def text_layer(img, items):
+    """items: (xy, text, font, fill, anchor, box) -- box draws a dark rounded background."""
+    base = Image.fromarray(img).convert("RGBA")
+    over = Image.new("RGBA", base.size)
+    d = ImageDraw.Draw(over)
+    for xy, text, f, fill, anchor, box in items:
+        if box:
+            l, t, r, b = d.textbbox(xy, text, font=f, anchor=anchor)
+            d.rounded_rectangle((l - 5, t - 3, r + 5, b + 3), 5, fill=(0, 0, 0, 170))
+        d.text(xy, text, font=f, fill=fill, anchor=anchor)
+    return np.array(Image.alpha_composite(base, over).convert("RGB"))
+
+
+def legend(img, y, removed):
+    """Line, dots, star and (with --remove) dashed-outline glyphs, returns the text items."""
+    x, items = 16, []
+    entries = [("line", "actual path (real video)"),
+               ("dots", "predicted without it" if removed else "predicted by ObjectJEPA"),
+               ("star", "predicted collision")] + ([("dash", "removed object")] if removed else [])
+    for kind, label in entries:
+        c = (200, 200, 200)
+        if kind == "line":
+            cv2.line(img, (x, y), (x + 34, y), c, 3, cv2.LINE_AA)
+        elif kind == "dots":
+            for k in range(3):
+                cv2.circle(img, (x + 5 + 12 * k, y), 6, WHITE, -1, cv2.LINE_AA)
+                cv2.circle(img, (x + 5 + 12 * k, y), 4, c, -1, cv2.LINE_AA)
+        elif kind == "star":
+            cv2.drawMarker(img, (x + 17, y), WHITE, cv2.MARKER_STAR, 22, 2, cv2.LINE_AA)
         else:
-            cv2.line(img, a, b, color, 2, cv2.LINE_AA)
+            for k in range(3):
+                cv2.line(img, (x + 12 * k, y), (x + 12 * k + 7, y), WHITE, 3, cv2.LINE_AA)
+        items.append(((x + 44, y), label, F_TEXT, (225, 225, 225), "lm", False))
+        x += 44 + int(F_TEXT.getlength(label)) + 30
+    return items
+
+
+def answer_lines(sc, removed, real, pred):
+    if removed:
+        res = sc.what_if_remove(removed)
+        lines = [f"Without the {' and the '.join(res['removed'])}:"]
+        lines += [f"+ new: {e['description']}" for e in res["newly_happen"]]
+        lines += [f"- no longer: {e['description']}" for e in res["no_longer_happen"]]
+        if len(lines) == 1:
+            lines.append("no change in which objects collide")
+        return lines
+    # collisions after the observed part only: actual (masks) vs predicted (rollout)
+    act, prd = (collisions(x[CTX:], a[CTX:], v[CTX:]) for x, a, v in (real, pred))
+    tag = {(1, 1): "\u2713 predicted, and it happens", (1, 0): "\u2717 predicted, but it doesn't happen",
+           (0, 1): "\u2717 missed"}
+    return ["Collisions after frame 32"] + [f"{tag[e in prd, e in act]}: the {sc.name(e[0])} + the {sc.name(e[1])}"
+                                            for e in sorted(act | prd)] + (["none"] if not act | prd else [])
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--video", required=True, help="e.g. video_09770")
-    ap.add_argument("--videos", default=os.path.expanduser("~/objectjepa_data/clevrer/train"))
-    ap.add_argument("--clevrer_root", default=os.path.expanduser("~/objectjepa_data/clevrer"))
-    ap.add_argument("--mask_dir", default=os.path.expanduser("~/objectjepa_data/sam_masks"))
+    ap.add_argument("--root", default=os.path.expanduser("~/objectjepa_data"),
+                    help="holds clevrer/ (videos, annotations, proposals) and sam_masks/")
     ap.add_argument("--masks", choices=["clevrer", "sam"], default="clevrer")
     ap.add_argument("--features", required=True, help="object features made with the same --masks")
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--remove", type=int, nargs="*", default=[], help="slot(s) to remove")
+    ap.add_argument("--question", default=None, help="text for the legend bar (default: made from --remove)")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--fps", type=int, default=12)
+    ap.add_argument("--fps", type=int, default=10)
+    ap.add_argument("--hold", type=float, default=4.0, help="seconds to show the answer at the end")
     args = ap.parse_args()
 
-    path = next(os.path.join(r, f) for r, _, fs in os.walk(args.videos) for f in fs if f == f"{args.video}.mp4")
+    sc = Scene(args.video, args.features, args.ckpt, args.masks, root=args.root)
+    path = next(os.path.join(r, f) for r, _, fs in os.walk(os.path.join(args.root, "clevrer"))
+                for f in fs if f == f"{args.video}.mp4")
     frames = read_frames(path)
-    objects, fmasks = (sam_masks(args.mask_dir, args.video) if args.masks == "sam"
-                       else clevrer_masks(args.clevrer_root, args.video))
-    d = torch.load(os.path.join(args.features, f"{args.video}.pt"), map_location="cpu")
-    model, mu, sd, cfg = load_model(args.ckpt)
-    real_xy, _, real_vis = observed_tracks(d, cfg["min_area"])
-    pred_xy, pred_area, pred_vis = rollout(model, mu, sd, d, cfg["min_area"], removed=args.remove)
+    objects, fmasks, removed = sc.objects, sc.fmasks, args.remove
+    colour = [COLOURS.get(o.get("color"), WHITE) for o in objects]
+    min_area = sc.cfg["min_area"]
+    real = observed_tracks(sc.d, min_area)
+    pred = rollout(sc.model, sc.mu, sc.sd, sc.d, min_area, removed=removed)
     scale = np.array([W_PX, H_PX])
-    real_xy, pred_xy = real_xy * scale, pred_xy * scale
-    r = np.sqrt(np.maximum(pred_area, 0) * PATCH_PX / np.pi)
+    real_xy, real_vis = real[0] * scale, real[2]
+    pred_xy, pred_vis = pred[0] * scale, pred[2]
+    r = np.sqrt(np.maximum(pred[1], 0) * PATCH_PX / np.pi)
+    question = args.question or (f"What if the {' and the '.join(sc.name(s) for s in removed)} were removed?"
+                                 if removed else "Where will the objects go? (prediction starts at frame 32)")
+    answer = answer_lines(sc, removed, real, pred)
 
+    W, H = W_PX * SCALE, H_PX * SCALE
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with av.open(args.out, "w") as out:
         st = out.add_stream("libx264", rate=args.fps)
-        st.width, st.height, st.pix_fmt = W_PX, H_PX, "yuv420p"
+        st.width, st.height, st.pix_fmt = W, H + BAR, "yuv420p"
+        st.options = {"crf": "18"}
+
+        def emit(img):
+            for pkt in st.encode(av.VideoFrame.from_ndarray(img, format="rgb24")):
+                out.mux(pkt)
+
         for fi in range(0, len(frames), 2):
-            img = np.ascontiguousarray(frames[fi])
             t = fi // STEP
-            for s, rle in fmasks[fi].items():
+            frame = np.ascontiguousarray(frames[fi])
+            for s in removed:
+                if s in fmasks[fi]:
+                    frame = fade_out(frame, rle_decode(fmasks[fi][s]))
+            img = np.zeros((H + BAR, W, 3), np.uint8)
+            img[:H] = cv2.resize(frame, (W, H), interpolation=cv2.INTER_CUBIC)
+            img[H:] = DARK
+            items = []
+            for s, rle in fmasks[fi].items():  # outlines + name labels
                 m = rle_decode(rle).astype(np.uint8)
-                color = (128, 128, 128) if s in args.remove else PALETTE[s % len(PALETTE)]
-                cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                cv2.drawContours(img, cnts, -1, color, 2)
-            for s in range(len(objects)):
-                if s in args.remove:
+                cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+                if s in removed:
+                    for c in cnts:
+                        dashed(img, c, WHITE)
+                else:
+                    cv2.drawContours(img, [c * SCALE for c in cnts], -1, colour[s], 2, cv2.LINE_AA)
+                ys, xs = np.nonzero(m)
+                lx = min(max(int(xs.mean() * SCALE), 90), W - 90)
+                if s in removed:  # below the object, so it doesn't hide the paths of the others
+                    items.append(((lx, min(int(ys.max() * SCALE) + 10, H - 40)), f"removed: {sc.name(s)}", F_LABEL,
+                                  WHITE, "mt", True))
+                else:
+                    items.append(((lx, max(int(ys.min() * SCALE) - 8, 52)), sc.name(s), F_LABEL, colour[s], "mb", True))
+            for s in range(len(objects)):  # paths
+                if s in removed:
                     continue
-                color = PALETTE[s % len(PALETTE)]
                 seen = [p for k, p in enumerate(real_xy[: t + 1, s]) if real_vis[k, s]]
-                draw_path(img, seen, color)
-                if t >= 8 and pred_vis[t, s]:  # predicted from frame 32 on
-                    draw_path(img, pred_xy[8 : t + 1, s], color, dotted=True)
-            if t >= 8:  # predicted collisions at this step
+                draw_path(img, seen, colour[s])
+                if t >= CTX and pred_vis[t, s]:
+                    draw_path(img, pred_xy[CTX - 1 : t + 1, s], colour[s], dotted=True)
+            if t >= CTX:  # predicted collisions at this step
                 for a in range(len(objects)):
                     for b in range(a + 1, len(objects)):
                         if pred_vis[t, a] and pred_vis[t, b] and \
                                 np.linalg.norm(pred_xy[t, a] - pred_xy[t, b]) < C * (r[t, a] + r[t, b]):
-                            mid = tuple(int(v) for v in (pred_xy[t, a] + pred_xy[t, b]) / 2)
-                            cv2.drawMarker(img, mid, (255, 255, 255), cv2.MARKER_STAR, 18, 2)
-            label = "observed" if t < 8 else ("what if: removed slot " + ",".join(map(str, args.remove))
-                                              if args.remove else "predicted (dotted) vs actual (solid)")
-            cv2.putText(img, f"frame {fi:3d}  {label}", (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
-                        cv2.LINE_AA)
-            for pkt in st.encode(av.VideoFrame.from_ndarray(img, format="rgb24")):
-                out.mux(pkt)
+                            mid = pt((pred_xy[t, a] + pred_xy[t, b]) / 2)
+                            cv2.drawMarker(img, mid, (0, 0, 0), cv2.MARKER_STAR, 34, 6, cv2.LINE_AA)
+                            cv2.drawMarker(img, mid, WHITE, cv2.MARKER_STAR, 34, 3, cv2.LINE_AA)
+            # progress bar: observed part in blue, playhead in white
+            y0 = H - 8
+            cv2.rectangle(img, (0, y0), (W, H), (60, 60, 66), -1)
+            cv2.rectangle(img, (0, y0), (W * CTX * STEP // len(frames), H), (50, 115, 255), -1)
+            cv2.rectangle(img, (W * fi // len(frames) - 2, y0 - 4), (W * fi // len(frames) + 2, H), WHITE, -1)
+            phase = "OBSERVED" if t < CTX else ("WHAT IF  (predicted)" if removed else "PREDICTED by ObjectJEPA")
+            items.append(((12, 12), f"{phase}   frame {fi:3d} / {len(frames) - 1}", F_BOLD,
+                          (120, 170, 255) if t < CTX else (255, 210, 90), "lt", True))
+            items.append(((16, H + 26), question, F_BOLD, WHITE, "lm", False))
+            items += legend(img, H + 72, removed)
+            img = text_layer(img, items)
+            emit(img)
+
+        # end card: the answer on a panel over the darkened last frame
+        img[:H] = (img[:H] * 0.3).astype(np.uint8)
+        lines = [l for a in answer for l in textwrap.wrap(a, 80, subsequent_indent="    ")]
+        y = H // 2 - 17 * len(lines)
+        cv2.rectangle(img, (50, y - 70), (W - 50, y + 34 * len(lines) + 10), DARK, -1)
+        cv2.rectangle(img, (50, y - 70), (W - 50, y + 34 * len(lines) + 10), (255, 210, 90), 2)
+        items = [((W // 2, y - 36), "ObjectJEPA answer", F_BIG, (255, 210, 90), "mm", False)]
+        items += [((80, y + 8 + 34 * i), l, F_TEXT if i else F_BOLD, WHITE, "lm", False) for i, l in enumerate(lines)]
+        img = text_layer(img, items)
+        for _ in range(int(args.hold * args.fps)):
+            emit(img)
         for pkt in st.encode():
             out.mux(pkt)
     print(f"wrote {args.out}")
