@@ -87,6 +87,7 @@ class ChatLLM:
         self.model = model or os.environ["META_MODEL"]
         self.key = os.environ[key_env]
         self.tokens_in = self.tokens_out = 0
+        self.first_usage = None
 
     @staticmethod
     def _wire(m):
@@ -117,6 +118,7 @@ class ChatLLM:
                           "messages": [self._wire(m) for m in messages],
                           "tools": [{"type": "function", "function": t} for t in tools]})
         usage = out.get("usage") or {}
+        self.first_usage = self.first_usage or usage
         self.tokens_in += usage.get("prompt_tokens", 0)
         self.tokens_out += usage.get("completion_tokens", 0)
         msg = out["choices"][0]["message"]
@@ -208,3 +210,4 @@ if __name__ == "__main__":
     if args.backend == "chat":
         print(f"tokens in {llm.tokens_in}, out {llm.tokens_out}, estimated ${cost():.4f} "
               f"(${args.price_in}/M in, ${args.price_out}/M out)" + ("  STOPPED at --max-usd" if cost() > args.max_usd else ""))
+        print("first response usage:", json.dumps(llm.first_usage))

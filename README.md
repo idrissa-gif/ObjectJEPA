@@ -2,7 +2,7 @@
 
 **An object-centric world model that predicts the future in latent space and answers "what if" questions about physical scenes.**
 
-Built for the Meta Global AI Developer Hackathon (2026).
+Built for the Meta Global AI Developer Hackathon (2026), Indie Developer track, "Push the Frontier".
 
 ObjectJEPA watches a short video of objects moving and colliding ([CLEVRER](http://clevrer.csail.mit.edu/)) and forecasts what happens next. It does not predict future pixels: it predicts future **representations**, the JEPA way. A frozen [V-JEPA 2](https://github.com/facebookresearch/vjepa2) encoder turns video into latent features, and a small transformer predictor learns to roll those latents forward in time. On top of that, object masks from SAM 3 give one latent per object, and an LLM agent (Muse Spark) uses the world model as a tool to answer predictive and counterfactual questions ("what happens if the red cube is removed?").
 
@@ -68,7 +68,10 @@ SAM 3 masks match the CLEVRER ground-truth masks with recall 0.991, precision 0.
 | **world-model delta** (remove the object's latents, roll out, apply the change to the observed events) | **0.791** | **0.438** |
 | no change (answer with the events of the real video) | 0.784 | 0.433 |
 | raw rollout (rebuild every collision from predicted positions) | 0.742 | 0.312 |
-| full agent on SAM 3 masks, no ground truth at all (offline parser) | 0.745 | 0.357 |
+| full agent on SAM 3 masks, no ground truth at all, offline parser (373 questions of 200 videos) | 0.745 | 0.357 |
+| **same, with Muse Spark** (`muse-spark-1.3` calling the tools; same 373 questions) | **0.771** | **0.397** |
+
+On SAM 3 masks, Muse Spark beats the rule-based parser by 2.6 points per option and 4 points per question. Both use the same tools and the same world model; only the language model that reads the question and calls the tools differs. The full 373-question run cost $5.50 (1.35 M input / 0.90 M output tokens).
 
 The gain over "no change" is small but significant (paired sign test on the options where the two disagree, p = 0.0025). A better forecaster barely moves this score, so the current bottleneck is reading collisions out of the predicted trajectories, not the latent prediction itself.
 
@@ -79,7 +82,7 @@ The gain over "no change" is small but significant (paired sign test on the opti
 | 1 | Frozen V-JEPA 2 feature extraction (sharded) | ✅ 10,000 videos |
 | 2 | Latent predictor vs. the baselines | ✅ beats all baselines |
 | 3 | **Object-centric**: SAM 3 masks, features pooled per object | ✅ |
-| 4 | **"What if" tools + agent**: remove an object's latents, roll out, compare collisions | ✅ offline parser; Muse Spark backend ready (`agent.py --backend chat`) |
+| 4 | **"What if" tools + agent**: remove an object's latents, roll out, compare collisions | ✅ offline parser and Muse Spark (`agent.py --backend chat`, `demo_live.py`) |
 | 5 | Demo videos (observed / predicted / what-if) | ✅ `visualize.py` |
 
 ## Files
@@ -96,6 +99,7 @@ The gain over "no change" is small but significant (paired sign test on the opti
 | `whatif.py` | Stage 4. Counterfactual rollouts and the CLEVRER counterfactual-question evaluation. |
 | `agent_tools.py` | Stage 4. Local tools for the agent: `describe_objects`, `observed_collisions`, `what_if_remove`. |
 | `agent.py` | Stage 4. Agent loop. `--backend offline` (rule-based, no API) or `--backend chat` (any OpenAI-compatible endpoint, e.g. Muse Spark). |
+| `demo_live.py` | Live demo: asks the agent one question and prints each tool call and result as it happens, then checks the answer against CLEVRER. `--offline` for no API call. |
 | `visualize.py` | Demo videos: observed, predicted and what-if, with object labels and the answer. |
 
 ## Setup and running
@@ -116,7 +120,23 @@ To run inside a conda env, use `CONDA_ENV=myenv bash run.sh`. Data goes to `~/ob
 - **Agent with an LLM**: `export META_API_KEY=...` (never commit it), then `python agent.py --backend chat --base-url <endpoint>/v1 --model <model> --features ... --ckpt ... --videos val_videos.txt --limit 10`. It prints the token count and an estimated cost, and stops once `--max-usd` (default 1) is reached.
 - **Knobs worth trying**: bigger predictor (`--width 512 --depth 8`), finer grid (`--pool 16`), bigger encoder (`--model facebook/vjepa2-vitg-fpc64-256`, 1408-d; the trainer reads the dimension from the data).
 
+## What was built during the hackathon (Oct 26 – Nov 4, 2026)
+
+All code in this repository was written during the event (first commit Oct 27, 2026):
+
+- the feature extraction pipeline (separate context/target encoding, full-frame resize, pooling, sharding) and the frame-level latent predictor with its baselines;
+- the object stage: SAM 3 mask extraction (`sam_masks.py`), per-object V-JEPA 2 latents and the object predictor;
+- the "what if" rollout and collision read-out (`whatif.py`), the agent tools (colour, shape and material from pixels) and the agent loop with the Muse Spark backend;
+- the evaluation (baselines, sign test, SAM vs ground-truth masks) and the demo renderer (`visualize.py`).
+
+Used as-is, not built here: the pretrained V-JEPA 2 and SAM 3 weights (loaded through Hugging Face `transformers`), the Muse Spark model through the Meta Model API, and the CLEVRER dataset.
+
 ## Acknowledgements
 
 - V-JEPA 2, SAM 3 and Muse Spark by Meta.
 - CLEVRER dataset: Yi, Gan, et al., *CLEVRER: CoLlision Events for Video REpresentation and Reasoning*, ICLR 2020.
+  Released under CC0 ([README](http://data.csail.mit.edu/clevrer/README.txt)).
+
+## License
+
+Code: MIT (see `LICENSE`). The pretrained models and the CLEVRER dataset keep their own licences.

@@ -1,0 +1,128 @@
+"""Live demo: ask the agent one "what if" question and show each tool call as it happens.
+
+    python demo_live.py                       # video_06926, question 14, Muse Spark
+    python demo_live.py --qid 15              # another CLEVRER question of the same video
+    python demo_live.py --question "What happens if the green sphere is removed?"
+    python demo_live.py --offline             # rule-based stand-in, no API call
+    python demo_live.py --wait                # load, then wait for Enter (for recording)
+
+Uses agent.answer unchanged; a thin wrapper around the LLM prints the model's tool
+calls and the tool results. For a CLEVRER question the ground truth is shown at
+the end. The Muse Spark backend reads META_API_KEY from the environment only.
+"""
+import argparse
+import json
+import os
+import sys
+import time
+
+from agent import ChatLLM, OfflineLLM, answer, parse_choices
+
+C = {"dim": "\033[2m", "bold": "\033[1m", "blue": "\033[94m", "orange": "\033[38;5;215m",
+     "green": "\033[92m", "red": "\033[91m", "end": "\033[0m"}
+
+
+def paint(text, *styles):
+    return "".join(C[s] for s in styles) + text + C["end"] if C else text
+
+
+def show_result(name, res):
+    if isinstance(res, dict) and "error" in res:
+        print(paint(f"    error: {res['error']}", "red"))
+    elif name == "describe_objects":
+        for o in res:
+            print(f"    slot {o['slot']}  {o['description']}")
+    elif name == "observed_collisions":
+        for e in res or [{"description": "(no collisions)"}]:
+            print(f"    • {e['description']}")
+    elif name == "what_if_remove":
+        new = {tuple(e["objects"]) for e in res["newly_happen"]}
+        print(f"    removed: {', '.join(res['removed']) or '(nothing)'}")
+        for e in res["collisions_without_them"]:
+            if tuple(e["objects"]) in new:
+                print(paint(f"    + NEW   {e['description']}", "orange", "bold"))
+            else:
+                print(f"    • still {e['description']}")
+        for e in res["no_longer_happen"]:
+            print(paint(f"    − GONE  {e['description']}", "dim"))
+    else:
+        print(f"    {json.dumps(res)}")
+
+
+class Narrated:
+    """Wraps an llm(messages, tools) callable and prints what goes in and out."""
+
+    def __init__(self, llm, label, pause):
+        self.llm, self.label, self.pause, self.seen = llm, label, pause, 0
+
+    def __call__(self, messages, tools):
+        for m in messages[self.seen:]:
+            if m["role"] == "tool":
+                print(paint(f"  ← {m['name']}", "blue"))
+                show_result(m["name"], json.loads(m["content"]))
+                time.sleep(self.pause)
+        print(paint(f"\n{self.label} is thinking…", "dim"))
+        t = time.time()
+        out = self.llm(messages, tools)
+        self.seen = len(messages)
+        for c in out.get("tool_calls", []):
+            args = json.dumps(c.get("arguments") or {})
+            print(paint(f"  → {c['name']}", "orange", "bold") + paint(f" {args}  ({time.time() - t:.1f} s)", "dim"))
+        return out
+
+
+if __name__ == "__main__":
+    from agent_tools import Scene
+
+    D = os.path.expanduser("~/objectjepa_data")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--video", default="video_06926")
+    ap.add_argument("--qid", type=int, default=14, help="CLEVRER question id in this video")
+    ap.add_argument("--question", default=None, help="free-form question instead of --qid")
+    ap.add_argument("--masks", choices=["clevrer", "sam"], default="sam")
+    ap.add_argument("--features", default=os.path.join(D, "obj_features_sam"))
+    ap.add_argument("--ckpt", default=os.path.join(D, "ckpt_obj_e60_w512d8"))
+    ap.add_argument("--questions", default=os.path.join(D, "clevrer/questions/train.json"))
+    ap.add_argument("--offline", action="store_true", help="rule-based parser, no API call")
+    ap.add_argument("--base-url", default=os.environ.get("META_BASE_URL", "https://api.meta.ai/v1"))
+    ap.add_argument("--model", default=os.environ.get("META_MODEL", "muse-spark-1.3"))
+    ap.add_argument("--pause", type=float, default=0.6, help="seconds between printed tool results")
+    ap.add_argument("--wait", action="store_true", help="load first, then wait for Enter (start recording meanwhile)")
+    ap.add_argument("--no-color", action="store_true")
+    args = ap.parse_args()
+    if args.no_color or not sys.stdout.isatty():
+        C = {}
+
+    choices, truth = None, None
+    if args.question:
+        question = args.question
+    else:
+        qs = next(v for v in json.load(open(args.questions)) if v["video_filename"] == f"{args.video}.mp4")
+        q = next(q for q in qs["questions"] if q["question_id"] == args.qid)
+        question, choices = q["question"], [c["choice"] for c in q.get("choices", [])] or None
+        truth = [c["answer"] == "correct" for c in q.get("choices", [])]
+
+    print(paint(f"Loading {args.video} ({args.masks.upper()} masks, world model {os.path.basename(args.ckpt)})…", "dim"))
+    scene = Scene(args.video, args.features, args.ckpt, args.masks)
+    llm = OfflineLLM() if args.offline else ChatLLM(args.base_url, args.model)
+    label = "offline parser" if args.offline else args.model
+    if args.wait:
+        input(paint("Ready. Press Enter to ask the question.", "dim"))
+        print("\033[2J\033[H" if C else "", end="")  # clear the screen
+
+    print(paint(f"\nQ: {question}", "bold"))
+    for i, c in enumerate(choices or []):
+        print(f"   {i}. {c}")
+    reply = answer(question, scene, Narrated(llm, label, args.pause), choices)
+
+    print(paint(f"\n{label} answers:", "bold"))
+    if choices:
+        for i, (c, yes) in enumerate(zip(choices, parse_choices(reply, len(choices)))):
+            mark = paint("✓", "green") if yes == truth[i] else paint("✗", "red")
+            print(f"   {mark} {i}. {'yes' if yes else 'no '}  {c}")
+        print(paint(f"   (✓ = matches the CLEVRER ground truth)", "dim"))
+    else:
+        print("   " + reply.replace("\n", "\n   "))
+    if not args.offline:
+        usd = (llm.tokens_in * 1.25 + llm.tokens_out * 4.25) / 1e6
+        print(paint(f"\n{llm.tokens_in} tokens in, {llm.tokens_out} out, ≈ ${usd:.3f}", "dim"))
