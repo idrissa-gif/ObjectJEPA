@@ -45,7 +45,8 @@ def clip_pairs(frames, window=32, stride=2, starts=(0, 64)):
 
 
 @torch.no_grad()
-def encode(model, processor, clips, device, pool, frame="squash"):
+def encode_tokens(model, processor, clips, device, frame="squash"):
+    """Patch tokens on the full grid: [B, t, side, side, D] float32 on device."""
     videos = [torch.from_numpy(np.ascontiguousarray(c)).permute(0, 3, 1, 2) for c in clips]  # T, C, H, W
     # The default processor center-crops to 256x256, which drops ~40% of the width of a
     # 480x320 CLEVRER frame. "squash" resizes the whole frame to 256x256 instead (the
@@ -58,7 +59,14 @@ def encode(model, processor, clips, device, pool, frame="squash"):
     B, N, D = h.shape
     t = len(clips[0]) // 2  # tubelet size 2
     side = int(math.isqrt(N // t))
-    h = h.float().reshape(B, t, side, side, D).permute(0, 1, 4, 2, 3).reshape(B * t, D, side, side)
+    return h.float().reshape(B, t, side, side, D)
+
+
+@torch.no_grad()
+def encode(model, processor, clips, device, pool, frame="squash"):
+    h = encode_tokens(model, processor, clips, device, frame)
+    B, t, side, _, D = h.shape
+    h = h.permute(0, 1, 4, 2, 3).reshape(B * t, D, side, side)
     h = F.adaptive_avg_pool2d(h, pool)  # [B*t, D, pool, pool]
     h = h.reshape(B, t, D, pool * pool).permute(0, 1, 3, 2)  # [B, t, P, D]
     return h.half().cpu()
