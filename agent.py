@@ -171,6 +171,8 @@ if __name__ == "__main__":
     ap.add_argument("--videos", required=True, help="text file with video names (use val videos)")
     ap.add_argument("--limit", type=int, default=0, help="max questions")
     ap.add_argument("--backend", choices=["offline", "chat"], default="offline")
+    ap.add_argument("--head", default=None, help="collision head checkpoint dir (default: distance rule)")
+    ap.add_argument("--update", default=None, help="learned what-if update dir, needs --head (default: delta rule)")
     ap.add_argument("--base-url", default=None, help="chat backend (default $META_BASE_URL)")
     ap.add_argument("--model", default=None, help="chat backend (default $META_MODEL)")
     ap.add_argument("--price-in", type=float, default=1.25, help="USD per M input tokens")
@@ -186,7 +188,7 @@ if __name__ == "__main__":
     for name in (l.strip() for l in open(args.videos)):
         if not os.path.exists(os.path.join(args.features, f"{name}.pt")) or name not in qs:
             continue
-        scene = Scene(name, args.features, args.ckpt, args.masks)
+        scene = Scene(name, args.features, args.ckpt, args.masks, head=args.head, update=args.update)
         for q in qs[name]["questions"]:
             if q["question_type"] != "counterfactual":
                 continue

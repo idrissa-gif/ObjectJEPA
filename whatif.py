@@ -19,6 +19,8 @@ with two ways of using the model and one baseline:
   no_change : counterfactual events = real events (no model). Strong, since the
               answer choices never involve the removed object and most other
               collisions do not change.
+  learned   : (with --head --head_fact --update) the delta rule replaced by a classifier
+              over the same world-model signals (whatif_update.py)
 
 python whatif.py --ckpt ckpt_obj --features obj_features --questions questions/train.json --videos val_videos.txt
 """
@@ -45,11 +47,12 @@ def load_model(ckpt_dir, device="cpu"):
 
 
 @torch.no_grad()
-def rollout(model, mu, sd, d, min_area, removed=(), n_calls=3, device="cpu"):
+def rollout(model, mu, sd, d, min_area, removed=(), n_calls=3, device="cpu", return_latents=False):
     """Positions/areas/visibility over the whole video, in tubelet steps (4 frames each).
 
     d: one video's features (from extract_object_features.py). Uses clip pair 0.
-    Returns xy [T, K, 2] in [0, 1], area [T, K] in patches, vis [T, K] bool.
+    Returns xy [T, K, 2] in [0, 1], area [T, K] in patches, vis [T, K] bool
+    (+ the normalised latents [T, K, D] as a CPU tensor if return_latents).
     """
     ctx = ((d["ctx"][0].float().to(device) - mu) / sd).unsqueeze(0)  # [1, Tc, K, D]
     area = d["ctx_area"][0].float().to(device).unsqueeze(0)
@@ -57,7 +60,7 @@ def rollout(model, mu, sd, d, min_area, removed=(), n_calls=3, device="cpu"):
     vis = area > min_area
     for k in removed:
         vis[..., k] = False
-    xys, areas, viss = [xy[0]], [area[0]], [vis[0]]
+    xys, areas, viss, zs = [xy[0]], [area[0]], [vis[0]], [ctx[0]]
     for _ in range(n_calls):
         pred, pxy = model(ctx, vis, xy)
         Tt = pred.shape[1]
@@ -65,8 +68,9 @@ def rollout(model, mu, sd, d, min_area, removed=(), n_calls=3, device="cpu"):
         seen = vis.any(1, keepdim=True).expand(-1, Tt, -1)
         a = last_seen(area.unsqueeze(-1), vis).squeeze(-1).expand(-1, Tt, -1)
         ctx, xy, vis, area = pred, pxy, seen, a
-        xys.append(xy[0]); areas.append(area[0]); viss.append(vis[0])
-    return torch.cat(xys).cpu().numpy(), torch.cat(areas).cpu().numpy(), torch.cat(viss).cpu().numpy()
+        xys.append(xy[0]); areas.append(area[0]); viss.append(vis[0]); zs.append(ctx[0])
+    out = torch.cat(xys).cpu().numpy(), torch.cat(areas).cpu().numpy(), torch.cat(viss).cpu().numpy()
+    return (*out, torch.cat(zs).cpu()) if return_latents else out
 
 
 def collisions(xy, area, vis, c=C):
@@ -112,10 +116,21 @@ def resolve(program, objects):
     return refs
 
 
-def eval_questions(model, mu, sd, cfg, feat_dir, questions, videos, device="cpu"):
+def eval_questions(model, mu, sd, cfg, feat_dir, questions, videos, device="cpu", head=None, thr=None, head_fact=False,
+                   update=None, rows=None):
+    """head: optional learned collision read-out (collision_head.py) used instead of the distance rule
+    on the rollouts (and on the observed video too if head_fact). update: optional learned what-if
+    update (whatif_update.py, needs head and head_fact), scored as "learned". rows: if a list, gets
+    (observed, factual, counterfactual logits, pair, collides after removal) per option, for fitting."""
+    from collision_head import head_logits, logit_events, observed
+    from whatif_update import update_events
+
+    def logits(r):
+        return head_logits(head, r[3], *r[:3], True, device)
+
     by_video = {q["video_filename"][:-4]: q for q in questions}
-    stats = {k: [0, 0] for k in ("predictor", "delta", "no_change")}  # [correct options, total]
-    per_q = {k: [0, 0] for k in stats}
+    stats = {k: [0, 0] for k in ("predictor", "delta", "no_change") + (("learned",) if update is not None else ())}
+    per_q = {k: [0, 0] for k in stats}  # stats: [correct options, total]
     skipped = 0
     for name in videos:
         path = os.path.join(feat_dir, f"{name}.pt")
@@ -123,7 +138,12 @@ def eval_questions(model, mu, sd, cfg, feat_dir, questions, videos, device="cpu"
             continue
         d = torch.load(path, map_location="cpu")
         objs = d["objects"]
-        fact = collisions(*observed_tracks(d, cfg["min_area"]))
+        if head is not None and head_fact:
+            z, area, xy = observed(d)
+            lf = head_logits(head, (z.to(device) - mu) / sd, xy, area, area > cfg["min_area"], False, device)
+            fact = logit_events(lf, thr)
+        else:
+            fact = collisions(*observed_tracks(d, cfg["min_area"]))
         base = None  # factual rollout, computed once per video
         for q in by_video[name]["questions"]:
             if q["question_type"] != "counterfactual":
@@ -135,14 +155,30 @@ def eval_questions(model, mu, sd, cfg, feat_dir, questions, videos, device="cpu"
                 continue
             x = next(iter(rem[0]))
             negate = q["program"][-1] == "negate"  # "which event will NOT happen": correct = absent
-            cf = collisions(*rollout(model, mu, sd, d, cfg["min_area"], removed=[x], device=device))
+            r_cf = rollout(model, mu, sd, d, cfg["min_area"], removed=[x], device=device, return_latents=head is not None)
             if base is None:
-                base = collisions(*rollout(model, mu, sd, d, cfg["min_area"], device=device))
+                r_base = rollout(model, mu, sd, d, cfg["min_area"], device=device, return_latents=head is not None)
+                if head is None:
+                    base = collisions(*r_base)
+                else:
+                    lb = logits(r_base)
+                    base = logit_events(lb, thr)
+            if head is None:
+                cf = collisions(*r_cf)
+            else:
+                lc = logits(r_cf)
+                cf = logit_events(lc, thr)
             answers = {
                 "predictor": cf,
                 "delta": (fact - (base - cf)) | (cf - base),
                 "no_change": fact,
             }
+            if update is not None:
+                answers["learned"] = update_events(update, lf, lb, lc, thr, removed=[x])
+            for (ra, rb), truth in choices:
+                pair = tuple(sorted((next(iter(ra)), next(iter(rb)))))
+                if rows is not None:
+                    rows.append((lf, lb, lc, pair, truth != negate))
             for k, ev in answers.items():
                 ok_all = True
                 for (ra, rb), truth in choices:
@@ -163,18 +199,35 @@ def main():
     ap.add_argument("--features", required=True)
     ap.add_argument("--questions", required=True)
     ap.add_argument("--videos", required=True, help="text file with one video name per line (use val videos)")
+    ap.add_argument("--head", default=None, help="collision head checkpoint dir (collision_head.py); default: distance rule")
+    ap.add_argument("--thr", type=float, default=None, help="head logit threshold (default: the one saved with the head)")
+    ap.add_argument("--head_fact", action="store_true", help="also read the observed video's collisions with the head")
+    ap.add_argument("--update", default=None, help="learned what-if update dir (whatif_update.py); needs --head --head_fact")
+    ap.add_argument("--tag", default="", help="suffix for the results file (whatif_eval<tag>.json)")
     args = ap.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, mu, sd, cfg = load_model(args.ckpt, device)
+    head, thr = None, None
+    if args.head:
+        from collision_head import load_head
+        head, thr = load_head(args.head, device)
+        thr = thr if args.thr is None else args.thr
     questions = json.load(open(args.questions))
     videos = [l.strip() for l in open(args.videos)]
-    res, skipped = eval_questions(model, mu, sd, cfg, args.features, questions, videos, device)
+    update = None
+    if args.update:
+        from whatif_update import load_update
+        update = load_update(args.update)
+    res, skipped = eval_questions(model, mu, sd, cfg, args.features, questions, videos, device, head, thr, args.head_fact,
+                                  update)
     for k, v in res.items():
         print(f"{k:10s} per-option {v['per_option']:.3f}  per-question {v['per_question']:.3f}  "
               f"({v['n_questions']} questions, {v['n_options']} options)")
     print(f"skipped {skipped} questions with an unparsed program")
-    with open(os.path.join(args.ckpt, "whatif_eval.json"), "w") as f:
-        json.dump({"results": res, "skipped": skipped, "videos": args.videos, "features": args.features}, f, indent=1)
+    with open(os.path.join(args.ckpt, f"whatif_eval{args.tag}.json"), "w") as f:
+        json.dump({"results": res, "skipped": skipped, "videos": args.videos, "features": args.features,
+                   "head": args.head, "thr": thr, "head_fact": args.head_fact,
+                   "update": args.update}, f, indent=1)
 
 
 if __name__ == "__main__":

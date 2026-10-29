@@ -21,6 +21,8 @@ import torch
 
 from extract_features import read_frames
 from extract_object_features import clevrer_masks, rle_decode, sam_masks
+from collision_head import head_logits, load_head, logit_events, observed
+from whatif_update import load_update, update_events
 from whatif import collisions, load_model, observed_tracks, rollout
 
 # mean RGB inside the true CLEVRER masks of each colour (measured on 10 videos)
@@ -49,11 +51,15 @@ class Scene:
     """Everything the tools need for one video: masks, object features, predictor."""
 
     def __init__(self, video, features, ckpt, masks="clevrer",
-                 root=os.path.expanduser("~/objectjepa_data"), device="cpu"):
+                 root=os.path.expanduser("~/objectjepa_data"), device="cpu", head=None, update=None):
         self.video, self.masks = video, masks
         self.d = torch.load(os.path.join(features, f"{video}.pt"), map_location="cpu")
         self.model, self.mu, self.sd, self.cfg = load_model(ckpt, device)
         self.device = device
+        # optional learned collision read-out (collision_head.py); default: distance rule
+        self.head, self.thr = load_head(head, device) if head else (None, None)
+        # optional learned what-if update (whatif_update.py, needs the head); default: delta rule
+        self.update = load_update(update) if update and head else None
         if masks == "sam":
             self.objects, self.fmasks = sam_masks(os.path.join(root, "sam_masks"), video)
             path = glob.glob(os.path.join(root, "clevrer", "train", "**", f"{video}.mp4"), recursive=True)[0]
@@ -70,6 +76,24 @@ class Scene:
         o = self.objects[s]
         return " ".join(x for x in (o.get("color"), o.get("material"), o.get("shape")) if x)
 
+    def _observed(self):
+        """(collision pairs, head logits or None) for the real video."""
+        if self.head is None:
+            return collisions(*observed_tracks(self.d, self.cfg["min_area"])), None
+        z, area, xy = observed(self.d)
+        lg = head_logits(self.head, (z.to(self.device) - self.mu) / self.sd, xy, area,
+                         area > self.cfg["min_area"], False, self.device)
+        return logit_events(lg, self.thr), lg
+
+    def _rollout(self, removed=()):
+        """(collision pairs, head logits or None) for a rollout with some objects removed."""
+        r = rollout(self.model, self.mu, self.sd, self.d, self.cfg["min_area"], removed=removed,
+                    device=self.device, return_latents=self.head is not None)
+        if self.head is None:
+            return collisions(*r), None
+        lg = head_logits(self.head, r[3], *r[:3], True, self.device)
+        return logit_events(lg, self.thr), lg
+
     def _events(self, pairs):
         return [{"objects": [a, b], "description": f"the {self.name(a)} collides with the {self.name(b)}"}
                 for a, b in sorted(pairs)]
@@ -80,17 +104,18 @@ class Scene:
                 for s, o in enumerate(self.objects)]
 
     def observed_collisions(self):
-        return self._events(collisions(*observed_tracks(self.d, self.cfg["min_area"])))
+        return self._events(self._observed()[0])
 
     def what_if_remove(self, objects):
         removed = [int(x) for x in objects]
-        fact = collisions(*observed_tracks(self.d, self.cfg["min_area"]))
+        fact, lf = self._observed()
         if self._base is None:
-            self._base = collisions(*rollout(self.model, self.mu, self.sd, self.d, self.cfg["min_area"],
-                                             device=self.device))
-        cf = collisions(*rollout(self.model, self.mu, self.sd, self.d, self.cfg["min_area"],
-                                 removed=removed, device=self.device))
-        after = {e for e in (fact - (self._base - cf)) | (cf - self._base) if not set(e) & set(removed)}
+            self._base = self._rollout()
+        (base, lb), (cf, lc) = self._base, self._rollout(removed)
+        if self.update is not None:
+            after = update_events(self.update, lf, lb, lc, self.thr, removed)
+        else:
+            after = {e for e in (fact - (base - cf)) | (cf - base) if not set(e) & set(removed)}
         return {
             "removed": [self.name(s) for s in removed],
             "collisions_without_them": self._events(after),

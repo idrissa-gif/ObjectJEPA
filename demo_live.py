@@ -83,6 +83,8 @@ if __name__ == "__main__":
     ap.add_argument("--features", default=os.path.join(D, "obj_features_sam"))
     ap.add_argument("--ckpt", default=os.path.join(D, "ckpt_obj_e60_w512d8"))
     ap.add_argument("--questions", default=os.path.join(D, "clevrer/questions/train.json"))
+    ap.add_argument("--head", default=os.path.join(D, "ckpt_collision"), help="collision head ('' = distance rule)")
+    ap.add_argument("--update", default=os.path.join(D, "ckpt_update"), help="learned what-if update ('' = delta rule)")
     ap.add_argument("--offline", action="store_true", help="rule-based parser, no API call")
     ap.add_argument("--base-url", default=os.environ.get("META_BASE_URL", "https://api.meta.ai/v1"))
     ap.add_argument("--model", default=os.environ.get("META_MODEL", "muse-spark-1.3"))
@@ -103,7 +105,7 @@ if __name__ == "__main__":
         truth = [c["answer"] == "correct" for c in q.get("choices", [])]
 
     print(paint(f"Loading {args.video} ({args.masks.upper()} masks, world model {os.path.basename(args.ckpt)})…", "dim"))
-    scene = Scene(args.video, args.features, args.ckpt, args.masks)
+    scene = Scene(args.video, args.features, args.ckpt, args.masks, head=args.head or None, update=args.update or None)
     llm = OfflineLLM() if args.offline else ChatLLM(args.base_url, args.model)
     label = "offline parser" if args.offline else args.model
     if args.wait:
