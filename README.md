@@ -4,7 +4,7 @@
 
 Built for the Meta Global AI Developer Hackathon (2026), Indie Developer track, "Push the Frontier".
 
-ObjectJEPA watches a short video of objects moving and colliding ([CLEVRER](http://clevrer.csail.mit.edu/)) and forecasts what happens next. It does not predict future pixels: it predicts future **representations**, the JEPA way. A frozen [V-JEPA 2](https://github.com/facebookresearch/vjepa2) encoder turns video into latent features, and a small transformer predictor learns to roll those latents forward in time. On top of that, object masks from SAM 3 give one latent per object, and an LLM agent (Muse Spark) uses the world model as a tool to answer predictive and counterfactual questions ("what happens if the red cube is removed?").
+ObjectJEPA watches a short video of objects moving and colliding ([CLEVRER](http://clevrer.csail.mit.edu/)) and forecasts what happens next. It does not predict future pixels: it predicts future **representations**, the JEPA way. A frozen [V-JEPA 2](https://github.com/facebookresearch/vjepa2) encoder turns video into latent features, and a small transformer predictor learns to roll those latents forward in time. On top of that, object masks from SAM 3 give one latent per object, and an LLM agent (Muse Spark) uses the world model as a tool to answer predictive and counterfactual questions ("what will happen next?", "what happens if the red cube is removed?").
 
 ## How it works
 
@@ -72,14 +72,31 @@ SAM 3 masks match the CLEVRER ground-truth masks with recall 0.991, precision 0.
 | first version: distance rule on positions, delta rule | 0.791 | 0.438 |
 | first version: no change (distance rule) | 0.784 | 0.433 |
 
-**Full agent on SAM 3 masks, no ground truth at all** (373 questions of 200 val videos; per option / per question)
+**Stage 4: "what will happen next?"** (714 CLEVRER predictive questions on the val videos: which of two collisions happens *after the video ends*; that event is in neither the video nor its annotations. Exactly one option is correct, chance 0.5.)
+
+| method | accuracy |
+|---|---|
+| **world model + collision head** (roll out from the last 32 frames, pick the pair the head scores higher in the next 32 frames) | **0.973** |
+| constant velocity (objects keep their last velocity) | 0.933 |
+| distance rule on the same rollout | 0.928 |
+
+The world model makes 2.5× fewer errors than constant-velocity physics (36 wins / 7 losses on the questions where they differ, sign test p = 9e-06). The window (32 frames, vs 64 or 96) was picked on the selection videos.
+
+**Full agent on SAM 3 masks, no ground truth at all** (counterfactual: 373 questions of 200 val videos; per option / per question)
 
 | agent | distance rule | + collision head | + learned update |
 |---|---|---|---|
 | offline parser (rule-based, no LLM) | 0.745 / 0.357 | 0.778 / 0.410 | 0.786 / 0.453 |
 | **Muse Spark** (`muse-spark-1.3` calling the tools) | 0.771 / 0.397 | 0.802 / 0.456 | **0.808 / 0.491** |
 
-Both agents use the same tools and the same world model; only the model that reads the question and calls the tools differs. With the full pipeline, Muse Spark beats the offline parser by 2.2 points per option and 3.8 per question. Each 373-question Muse Spark run costs about $5.50 (≈1.36 M input / 0.9 M output tokens).
+Final pipeline, both question types (the agent has all four tools, including `predict_future`; same 200 videos):
+
+| agent | counterfactual (373 q), per option / per question | "what will happen next?" (148 q), per option / per question |
+|---|---|---|
+| offline parser (rule-based, no LLM) | 0.786 / 0.453 | 0.939 / 0.939 |
+| **Muse Spark** (`muse-spark-1.3`) | **0.811 / 0.517** | 0.912 / 0.845 |
+
+Both agents use the same tools and the same world model; only the model that reads the question and calls the tools differs. Muse Spark is better on counterfactual questions (6 of them ran out of tool-call steps and count as wrong). On "what will happen next?" it is lower: 20 of its 23 misses answer "no" to both options (17) or "yes" to both (3), although exactly one is correct. The parser always says yes to exactly one option; when neither option's pair is in `predict_future`'s list (pairs scoring under 0.01 are left out) it says yes to option 0. That happened on 24 questions and was right on 18, against 12 expected by chance, so part of its 0.939 is luck. The 521 questions cost $7.87 in API tokens.
 
 **Collision head** (`collision_head.py`). The first version read collisions out of predicted positions with a distance rule, and its gain over "no change" was small (p = 0.0025): a better forecaster barely moved the score, so the bottleneck was the read-out, not the latent prediction. The head is a small temporal convolution over pairs of object latents plus geometry, trained on CLEVRER's annotated collisions on both real and predicted sequences (8,000 train videos; 1,000 other train videos pick the epoch and threshold). On predicted future steps it raises event F1 from 0.762 (distance rule) to 0.898.
 
@@ -92,8 +109,8 @@ Both agents use the same tools and the same world model; only the model that rea
 | 1 | Frozen V-JEPA 2 feature extraction (sharded) | ✅ 10,000 videos |
 | 2 | Latent predictor vs. the baselines | ✅ beats all baselines |
 | 3 | **Object-centric**: SAM 3 masks, features pooled per object | ✅ |
-| 4 | **"What if" tools + agent**: remove an object's latents, roll out, compare collisions | ✅ collision head, learned update, offline parser and Muse Spark (`agent.py --backend chat`, `demo_live.py`) |
-| 5 | Demo videos (observed / predicted / what-if) | ✅ `visualize.py` |
+| 4 | **"What if" and "what next" tools + agent**: remove an object's latents and roll out; roll out past the end of the video | ✅ collision head, learned update, `predict_future`, offline parser and Muse Spark (`agent.py --backend chat`, `demo_live.py`) |
+| 5 | Demo videos (observed / predicted / what-if / after the video) | ✅ `visualize.py` |
 
 ## Files
 
@@ -109,10 +126,11 @@ Both agents use the same tools and the same world model; only the model that rea
 | `whatif.py` | Stage 4. Counterfactual rollouts and the CLEVRER counterfactual-question evaluation (`--head --head_fact --update` for the learned read-out). |
 | `collision_head.py` | Stage 4. Learned collision head: per pair and step contact logits from object latents + geometry. |
 | `whatif_update.py` | Stage 4. Learned what-if update over the head's scores on the real video and both rollouts. |
-| `agent_tools.py` | Stage 4. Local tools for the agent: `describe_objects`, `observed_collisions`, `what_if_remove`. |
+| `predict_next.py` | Stage 4. "What will happen next?": rollout from the last clip, pair scores from the collision head, evaluation vs constant velocity. |
+| `agent_tools.py` | Stage 4. Local tools for the agent: `describe_objects`, `observed_collisions`, `what_if_remove`, `predict_future`. |
 | `agent.py` | Stage 4. Agent loop. `--backend offline` (rule-based, no API) or `--backend chat` (any OpenAI-compatible endpoint, e.g. Muse Spark). |
-| `demo_live.py` | Live demo: asks the agent one question and prints each tool call and result as it happens, then checks the answer against CLEVRER. `--offline` for no API call. |
-| `visualize.py` | Demo videos: observed, predicted and what-if, with object labels and the answer. |
+| `demo_live.py` | Live demo: asks the agent one or more questions (`--qid 14 13`) and prints each tool call and result as it happens, then checks the answer against CLEVRER. `--offline` for no API call. |
+| `visualize.py` | Demo videos: observed, predicted, what-if (`--remove`) and after the end of the video (`--future`), with object labels and the answer. |
 
 ## Setup and running
 
@@ -129,7 +147,7 @@ To run inside a conda env, use `CONDA_ENV=myenv bash run.sh`. Data goes to `~/ob
 ### Notes
 
 - **Full frame, not center crop.** The default V-JEPA 2 processor center-crops to 256×256, which drops ~40% of the width of a 480×320 CLEVRER frame (objects entering from the sides disappear). `extract_features.py --frame squash` (the default) resizes the whole frame to 256×256 instead. `--frame crop` restores the processor default.
-- **Agent with an LLM**: `export META_API_KEY=...` (never commit it), then `python agent.py --backend chat --base-url <endpoint>/v1 --model <model> --features ... --ckpt ... --videos val_videos.txt --limit 10`. It prints the token count and an estimated cost, and stops once `--max-usd` (default 1) is reached.
+- **Agent with an LLM**: `export META_API_KEY=...` (never commit it), then `python agent.py --backend chat --base-url <endpoint>/v1 --model <model> --features ... --ckpt ... --videos val_videos.txt --limit 10`. It prints the token count and an estimated cost, and stops once `--max-usd` (default 1) is reached. `--types counterfactual,predictive` adds the "what will happen next?" questions (default: counterfactual only).
 - **Collision head and learned update**: `python collision_head.py --features obj_features_clevrer --ckpt ckpt_obj --val_videos val_videos.txt --out ckpt_collision`, then `python whatif_update.py --features obj_features_clevrer --ckpt ckpt_obj --head ckpt_collision --videos ckpt_collision/dev_videos.txt --out ckpt_update` (the head's selection videos, written by `collision_head.py`; never val). Pass `--head ckpt_collision --update ckpt_update` to `agent.py` and `demo_live.py` (and `--head_fact` to `whatif.py`).
 - **Knobs worth trying**: bigger predictor (`--width 512 --depth 8`), finer grid (`--pool 16`), bigger encoder (`--model facebook/vjepa2-vitg-fpc64-256`, 1408-d; the trainer reads the dimension from the data).
 
@@ -139,7 +157,7 @@ All code in this repository was written during the event (first commit Oct 27, 2
 
 - the feature extraction pipeline (separate context/target encoding, full-frame resize, pooling, sharding) and the frame-level latent predictor with its baselines;
 - the object stage: SAM 3 mask extraction (`sam_masks.py`), per-object V-JEPA 2 latents and the object predictor;
-- the "what if" rollout and collision read-out (`whatif.py`), the learned collision head (`collision_head.py`) and what-if update (`whatif_update.py`), the agent tools (colour, shape and material from pixels) and the agent loop with the Muse Spark backend;
+- the "what if" rollout and collision read-out (`whatif.py`), the learned collision head (`collision_head.py`) and what-if update (`whatif_update.py`), the "what will happen next" forecast (`predict_next.py`), the agent tools (colour, shape and material from pixels) and the agent loop with the Muse Spark backend;
 - the evaluation (baselines, sign test, SAM vs ground-truth masks) and the demo renderer (`visualize.py`).
 
 Used as-is, not built here: the pretrained V-JEPA 2 and SAM 3 weights (loaded through Hugging Face `transformers`), the Muse Spark model through the Meta Model API, and the CLEVRER dataset.

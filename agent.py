@@ -27,7 +27,8 @@ from agent_tools import TOOLS, run_tool
 SYSTEM = (
     "You answer questions about a short physics video of objects sliding and colliding. "
     "Use the tools: describe_objects to see the objects and their slot numbers, observed_collisions "
-    "for what really happens, what_if_remove to simulate the video without some objects. "
+    "for what really happens, what_if_remove to simulate the video without some objects, predict_future "
+    "for what will happen after the video ends. "
     "For multiple-choice questions, answer with one line per option: '<option number>: yes' or '<option number>: no'."
 )
 
@@ -49,13 +50,17 @@ def match_objects(text, objects):
 
 
 class OfflineLLM:
-    """Stand-in for the language model: handles '... if/without <object> ... removed' questions."""
+    """Stand-in for the language model: handles '... if/without <object> ... removed' questions
+    and 'what will happen next?' questions."""
 
     def __call__(self, messages, tools):
         tool_msgs = [m for m in messages if m["role"] == "tool"]
         question = next(m["content"] for m in messages if m["role"] == "user")
         if not tool_msgs:
             return {"tool_calls": [{"name": "describe_objects", "arguments": {}}]}
+        predictive = "next" in question.split("\n")[0].lower()  # "What will happen next?"
+        if len(tool_msgs) == 1 and predictive:
+            return {"tool_calls": [{"name": "predict_future", "arguments": {}}]}
         if len(tool_msgs) == 1:
             objects = json.loads(tool_msgs[0]["content"])
             head = question.split("\n")[0]
@@ -64,19 +69,22 @@ class OfflineLLM:
             return {"tool_calls": [{"name": "what_if_remove", "arguments": {"objects": target[:1]}}]}
         objects = json.loads(tool_msgs[0]["content"])
         result = json.loads(tool_msgs[-1]["content"])
-        happen = {tuple(sorted(e["objects"])) for e in result["collisions_without_them"]}
-        negate = " not " in question.split("\n")[0].lower()
-        lines = []
+        options = []  # (option number, slot pair or None)
         for line in question.split("\n")[1:]:
             mm = re.match(r"(\d+)\. (.+)", line.strip())
             if not mm:
                 continue
             parts = re.split(r" collides with | and | collide", mm.group(2).lower())
             refs = [match_objects(p, objects) for p in parts[:2]]
-            pair = tuple(sorted((refs[0][0], refs[1][0]))) if all(len(r) == 1 for r in refs) else None
-            yes = (pair in happen) != negate if pair else False
-            lines.append(f"{mm.group(1)}: {'yes' if yes else 'no'}")
-        return {"content": "\n".join(lines)}
+            options.append((mm.group(1), tuple(sorted((refs[0][0], refs[1][0]))) if all(len(r) == 1 for r in refs) else None))
+        if predictive:  # exactly one option happens: pick the best-ranked pair
+            rank = {tuple(sorted(e["objects"])): e["rank"] for e in result["after_the_video"]}
+            best = min(options, key=lambda o: rank.get(o[1], 99))[0] if options else None
+            return {"content": "\n".join(f"{i}: {'yes' if i == best else 'no'}" for i, _ in options)}
+        happen = {tuple(sorted(e["objects"])) for e in result["collisions_without_them"]}
+        negate = " not " in question.split("\n")[0].lower()
+        return {"content": "\n".join(f"{i}: {'yes' if ((pair in happen) != negate if pair else False) else 'no'}"
+                                      for i, pair in options)}
 
 
 class ChatLLM:
@@ -170,6 +178,8 @@ if __name__ == "__main__":
     ap.add_argument("--questions", default=os.path.expanduser("~/objectjepa_data/clevrer/questions/train.json"))
     ap.add_argument("--videos", required=True, help="text file with video names (use val videos)")
     ap.add_argument("--limit", type=int, default=0, help="max questions")
+    ap.add_argument("--types", default="counterfactual", help="comma-separated CLEVRER question types "
+                    "(counterfactual, predictive)")
     ap.add_argument("--backend", choices=["offline", "chat"], default="offline")
     ap.add_argument("--head", default=None, help="collision head checkpoint dir (default: distance rule)")
     ap.add_argument("--update", default=None, help="learned what-if update dir, needs --head (default: delta rule)")
@@ -185,12 +195,14 @@ if __name__ == "__main__":
     cost = lambda: (getattr(llm, "tokens_in", 0) * args.price_in + getattr(llm, "tokens_out", 0) * args.price_out) / 1e6
     logf = open(args.log, "w") if args.log else None
     n_opt, ok_opt, n_q, ok_q = 0, 0, 0, 0
+    types = args.types.split(",")
+    by_type = {t: [0, 0, 0, 0] for t in types}  # options, correct options, questions, correct questions
     for name in (l.strip() for l in open(args.videos)):
         if not os.path.exists(os.path.join(args.features, f"{name}.pt")) or name not in qs:
             continue
         scene = Scene(name, args.features, args.ckpt, args.masks, head=args.head, update=args.update)
         for q in qs[name]["questions"]:
-            if q["question_type"] != "counterfactual":
+            if q["question_type"] not in types:
                 continue
             msgs = []
             got = parse_choices(answer(q["question"], scene, llm, [c["choice"] for c in q["choices"]], log=msgs),
@@ -198,8 +210,11 @@ if __name__ == "__main__":
             truth = [c["answer"] == "correct" for c in q["choices"]]
             ok = [g == t for g, t in zip(got, truth)]
             n_opt, ok_opt, n_q, ok_q = n_opt + len(ok), ok_opt + sum(ok), n_q + 1, ok_q + all(ok)
+            t = by_type[q["question_type"]]
+            t[0], t[1], t[2], t[3] = t[0] + len(ok), t[1] + sum(ok), t[2] + 1, t[3] + all(ok)
             if logf:
-                logf.write(json.dumps({"video": name, "question_id": q["question_id"], "truth": truth,
+                logf.write(json.dumps({"video": name, "question_id": q["question_id"], "type": q["question_type"],
+                                       "truth": truth,
                                        "got": got, "messages": msgs}) + "\n")
                 logf.flush()
             if (args.limit and n_q >= args.limit) or cost() > args.max_usd:
@@ -209,6 +224,9 @@ if __name__ == "__main__":
     label = "offline parser" if args.backend == "offline" else llm.model
     print(f"agent ({label}, {args.masks} masks): per-option {ok_opt / max(1, n_opt):.3f} "
           f"per-question {ok_q / max(1, n_q):.3f} ({n_q} questions)")
+    if len(types) > 1:
+        for t, (no, oo, nq, oq) in by_type.items():
+            print(f"  {t:15s} per-option {oo / max(1, no):.3f} per-question {oq / max(1, nq):.3f} ({nq} questions)")
     if args.backend == "chat":
         print(f"tokens in {llm.tokens_in}, out {llm.tokens_out}, estimated ${cost():.4f} "
               f"(${args.price_in}/M in, ${args.price_out}/M out)" + ("  STOPPED at --max-usd" if cost() > args.max_usd else ""))

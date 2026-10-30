@@ -1,6 +1,7 @@
 """Live demo: ask the agent one "what if" question and show each tool call as it happens.
 
     python demo_live.py                       # video_06926, question 14, Muse Spark
+    python demo_live.py --qid 14 13 --wait    # "what if", then "what will happen next?" on the same scene
     python demo_live.py --qid 15              # another CLEVRER question of the same video
     python demo_live.py --question "What happens if the green sphere is removed?"
     python demo_live.py --offline             # rule-based stand-in, no API call
@@ -45,6 +46,12 @@ def show_result(name, res):
                 print(f"    • still {e['description']}")
         for e in res["no_longer_happen"]:
             print(paint(f"    − GONE  {e['description']}", "dim"))
+    elif name == "predict_future":
+        for e in res["after_the_video"][:5]:
+            line = f"    {e['rank']}. {e['description']}  (score {e['score']:.2f})"
+            print(paint(line, "orange", "bold") if e["rank"] == 1 else line)
+        if not res["after_the_video"]:
+            print("    (no collision expected)")
     else:
         print(f"    {json.dumps(res)}")
 
@@ -77,7 +84,8 @@ if __name__ == "__main__":
     D = os.path.expanduser("~/objectjepa_data")
     ap = argparse.ArgumentParser()
     ap.add_argument("--video", default="video_06926")
-    ap.add_argument("--qid", type=int, default=14, help="CLEVRER question id in this video")
+    ap.add_argument("--qid", type=int, nargs="+", default=[14], help="CLEVRER question id(s) in this video, "
+                    "asked one after the other (e.g. 14 13: what if, then what next)")
     ap.add_argument("--question", default=None, help="free-form question instead of --qid")
     ap.add_argument("--masks", choices=["clevrer", "sam"], default="sam")
     ap.add_argument("--features", default=os.path.join(D, "obj_features_sam"))
@@ -95,36 +103,39 @@ if __name__ == "__main__":
     if args.no_color or not sys.stdout.isatty():
         C = {}
 
-    choices, truth = None, None
+    asks = []  # (question, choices or None, truth or None)
     if args.question:
-        question = args.question
+        asks.append((args.question, None, None))
     else:
         qs = next(v for v in json.load(open(args.questions)) if v["video_filename"] == f"{args.video}.mp4")
-        q = next(q for q in qs["questions"] if q["question_id"] == args.qid)
-        question, choices = q["question"], [c["choice"] for c in q.get("choices", [])] or None
-        truth = [c["answer"] == "correct" for c in q.get("choices", [])]
+        for qid in args.qid:
+            q = next(q for q in qs["questions"] if q["question_id"] == qid)
+            asks.append((q["question"], [c["choice"] for c in q.get("choices", [])] or None,
+                         [c["answer"] == "correct" for c in q.get("choices", [])]))
 
     print(paint(f"Loading {args.video} ({args.masks.upper()} masks, world model {os.path.basename(args.ckpt)})…", "dim"))
     scene = Scene(args.video, args.features, args.ckpt, args.masks, head=args.head or None, update=args.update or None)
     llm = OfflineLLM() if args.offline else ChatLLM(args.base_url, args.model)
     label = "offline parser" if args.offline else args.model
-    if args.wait:
-        input(paint("Ready. Press Enter to ask the question.", "dim"))
-        print("\033[2J\033[H" if C else "", end="")  # clear the screen
 
-    print(paint(f"\nQ: {question}", "bold"))
-    for i, c in enumerate(choices or []):
-        print(f"   {i}. {c}")
-    reply = answer(question, scene, Narrated(llm, label, args.pause), choices)
+    for n, (question, choices, truth) in enumerate(asks):
+        if args.wait:
+            input(paint("Ready. Press Enter to ask the question." if n == 0 else "\nPress Enter for the next question.", "dim"))
+            print("\033[2J\033[H" if C else "", end="")  # clear the screen
+        used = (getattr(llm, "tokens_in", 0), getattr(llm, "tokens_out", 0))
+        print(paint(f"\nQ: {question}", "bold"))
+        for i, c in enumerate(choices or []):
+            print(f"   {i}. {c}")
+        reply = answer(question, scene, Narrated(llm, label, args.pause), choices)
 
-    print(paint(f"\n{label} answers:", "bold"))
-    if choices:
-        for i, (c, yes) in enumerate(zip(choices, parse_choices(reply, len(choices)))):
-            mark = paint("✓", "green") if yes == truth[i] else paint("✗", "red")
-            print(f"   {mark} {i}. {'yes' if yes else 'no '}  {c}")
-        print(paint(f"   (✓ = matches the CLEVRER ground truth)", "dim"))
-    else:
-        print("   " + reply.replace("\n", "\n   "))
-    if not args.offline:
-        usd = (llm.tokens_in * 1.25 + llm.tokens_out * 4.25) / 1e6
-        print(paint(f"\n{llm.tokens_in} tokens in, {llm.tokens_out} out, ≈ ${usd:.3f}", "dim"))
+        print(paint(f"\n{label} answers:", "bold"))
+        if choices:
+            for i, (c, yes) in enumerate(zip(choices, parse_choices(reply, len(choices)))):
+                mark = paint("✓", "green") if yes == truth[i] else paint("✗", "red")
+                print(f"   {mark} {i}. {'yes' if yes else 'no '}  {c}")
+            print(paint(f"   (✓ = matches the CLEVRER ground truth)", "dim"))
+        else:
+            print("   " + reply.replace("\n", "\n   "))
+        if not args.offline:
+            t_in, t_out = llm.tokens_in - used[0], llm.tokens_out - used[1]
+            print(paint(f"\n{t_in} tokens in, {t_out} out, ≈ ${(t_in * 1.25 + t_out * 4.25) / 1e6:.3f}", "dim"))

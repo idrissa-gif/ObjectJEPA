@@ -9,6 +9,8 @@ Tools (see TOOLS for the JSON schemas given to the model):
   observed_collisions(video)         -> collisions seen in the real video
   what_if_remove(video, objects)     -> collisions that disappear / appear when
                                         objects are removed (delta rollout)
+  predict_future(video)              -> collisions forecast after the video ends,
+                                        ranked by score (predict_next.py)
 
 Objects are referred to by slot number, as returned by describe_objects.
 """
@@ -21,7 +23,8 @@ import torch
 
 from extract_features import read_frames
 from extract_object_features import clevrer_masks, rle_decode, sam_masks
-from collision_head import head_logits, load_head, logit_events, observed
+from collision_head import PAIRS, head_logits, load_head, logit_events, observed
+from predict_next import future_scores
 from whatif_update import load_update, update_events
 from whatif import collisions, load_model, observed_tracks, rollout
 
@@ -123,6 +126,16 @@ class Scene:
             "newly_happen": self._events(after - fact),
         }
 
+    def predict_future(self):
+        s = future_scores(self.model, self.mu, self.sd, self.d, self.cfg["min_area"], self.head, self.device)
+        # head logit -> 0..1 score; without a head, closest approach (ratio 1 = touching) -> 0..1
+        p = 1 / (1 + np.exp(-s)) if self.head is not None else 1 / (1 + np.exp(4 * (-s - 1.5)))
+        order = [j for j in np.argsort(-s, kind="stable") if p[j] >= 0.01]  # raw scores: no ties from rounding
+        return {"after_the_video": [e | {"rank": i + 1, "score": round(float(p[j]), 3)}
+                                    for i, j in enumerate(order) for e in self._events([tuple(PAIRS[j].tolist())])],
+                "note": "ranked from most to least likely to collide in the next 32 frames (score 0-1); "
+                        "pairs not listed score < 0.01"}
+
 
 TOOLS = [
     {"name": "describe_objects",
@@ -138,6 +151,10 @@ TOOLS = [
                     "properties": {"objects": {"type": "array", "items": {"type": "integer"},
                                                "description": "slot numbers from describe_objects"}},
                     "required": ["objects"]}},
+    {"name": "predict_future",
+     "description": "Forecast, with the learned world model, which collisions will happen after the video ends. "
+                    "Returns object pairs ranked by a score from 0 to 1.",
+     "parameters": {"type": "object", "properties": {}, "required": []}},
 ]
 
 
@@ -148,6 +165,8 @@ def run_tool(scene, name, args):
         return scene.observed_collisions()
     if name == "what_if_remove":
         return scene.what_if_remove(args["objects"])
+    if name == "predict_future":
+        return scene.predict_future()
     raise ValueError(f"unknown tool {name}")
 
 
