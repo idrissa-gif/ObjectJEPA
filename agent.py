@@ -28,7 +28,7 @@ SYSTEM = (
     "You answer questions about a short physics video of objects sliding and colliding. "
     "Use the tools: describe_objects to see the objects and their slot numbers, observed_collisions "
     "for what really happens, what_if_remove to simulate the video without some objects, predict_future "
-    "for what will happen after the video ends. "
+    "for what will happen after the video ends (these questions have exactly one correct option). "
     "For multiple-choice questions, answer with one line per option: '<option number>: yes' or '<option number>: no'."
 )
 

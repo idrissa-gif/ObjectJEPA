@@ -130,11 +130,12 @@ class Scene:
         s = future_scores(self.model, self.mu, self.sd, self.d, self.cfg["min_area"], self.head, self.device)
         # head logit -> 0..1 score; without a head, closest approach (ratio 1 = touching) -> 0..1
         p = 1 / (1 + np.exp(-s)) if self.head is not None else 1 / (1 + np.exp(4 * (-s - 1.5)))
-        order = [j for j in np.argsort(-s, kind="stable") if p[j] >= 0.01]  # raw scores: no ties from rounding
+        n = len(self.objects)  # every pair of objects, so two options can always be compared
+        order = [j for j in np.argsort(-s, kind="stable") if PAIRS[j].max() < n]  # raw scores: no ties from rounding
         return {"after_the_video": [e | {"rank": i + 1, "score": round(float(p[j]), 3)}
                                     for i, j in enumerate(order) for e in self._events([tuple(PAIRS[j].tolist())])],
-                "note": "ranked from most to least likely to collide in the next 32 frames (score 0-1); "
-                        "pairs not listed score < 0.01"}
+                "note": "every pair of objects, ranked from most to least likely to collide in the next 32 frames "
+                        "(score 0-1; the rank also orders pairs whose scores round to the same value)"}
 
 
 TOOLS = [
