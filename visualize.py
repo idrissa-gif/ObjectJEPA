@@ -6,15 +6,18 @@ in the object's own colour):
   solid line  : actual centroid path (from the masks)
   dotted line : predicted path
   star        : predicted collision
-  with --remove: the removed object is faded out of the frames with a dashed
-  outline, the dotted lines are the counterfactual paths of the others, and the
-  last frames show the answer of the what_if_remove tool (the one the agent uses).
+  with --remove: the removed object is erased from the observed frames (painted
+  over with the empty floor), then the frame freezes at frame 31 and moving rings
+  show the counterfactual forecast of the others (no real pixels after frame 31,
+  so nothing on screen shows what the removed object really did); stars are the
+  collisions of the what_if_remove answer (the tool the agent uses), placed where
+  the collision head is surest, and the end card shows that answer.
   with --future: the real video plays to its end (frame 127), then the last frame
   freezes and the predictor keeps going (frames 128-159, predict_next.py): moving
   rings are the predicted objects, stars the collisions predicted with score >= 0.5,
   and the end card shows the ranking of the predict_future tool.
 
-python visualize.py --video video_06926 --masks sam --features obj_features_sam --ckpt ckpt_obj --remove 2 --out demo.mp4
+python visualize.py --video video_06926 --masks sam --features obj_features_sam --ckpt ckpt_obj --head ckpt_collision --update ckpt_update --remove 2 --out demo.mp4
 python visualize.py --video video_07635 --masks sam --features obj_features_sam --ckpt ckpt_obj --head ckpt_collision --future --out next.mp4
 """
 import argparse
@@ -151,15 +154,18 @@ def main():
     ap.add_argument("--fps", type=int, default=10)
     ap.add_argument("--hold", type=float, default=4.0, help="seconds to show the answer at the end")
     ap.add_argument("--future", action="store_true", help="forecast after the end of the video (needs --head)")
-    ap.add_argument("--head", default=None, help="collision head checkpoint dir (for --future)")
+    ap.add_argument("--head", default=None, help="collision head checkpoint dir (for --future; with --remove, places the stars)")
+    ap.add_argument("--update", default=None, help="learned what-if update dir (with --remove and --head), as in the agent")
     args = ap.parse_args()
 
-    sc = Scene(args.video, args.features, args.ckpt, args.masks, root=args.root, head=args.head)
+    sc = Scene(args.video, args.features, args.ckpt, args.masks, root=args.root, head=args.head, update=args.update)
     path = next(os.path.join(r, f) for r, _, fs in os.walk(os.path.join(args.root, "clevrer"))
                 for f in fs if f == f"{args.video}.mp4")
     frames = read_frames(path)
     if args.future:
         return future_video(args, sc, frames)
+    if args.remove:
+        return whatif_video(args, sc, frames)
     objects, fmasks, removed = sc.objects, sc.fmasks, args.remove
     colour = [COLOURS.get(o.get("color"), WHITE) for o in objects]
     min_area = sc.cfg["min_area"]
@@ -339,7 +345,8 @@ def future_video(args, sc, frames, per_step=4):
                     mid = pt((fut_xy[t_hit + 1, a] + fut_xy[t_hit + 1, b]) / 2)
                     cv2.drawMarker(img, mid, (0, 0, 0), cv2.MARKER_STAR, 40, 7, cv2.LINE_AA)
                     cv2.drawMarker(img, mid, WHITE, cv2.MARKER_STAR, 40, 3, cv2.LINE_AA)
-            emit(chrome(img, items, n_real - 1 + int(round(u * STEP)), True))
+            img = chrome(img, items, n_real - 1 + int(round(u * STEP)), True)
+            emit(img)
 
         answer = ["Forecast after the end of the video (predict_future):"]
         answer += [f"{e['rank']}. {e['description']}  (score {e['score']:.2f})" for e in ranking[:3] if e["score"] >= 0.01] or ["no collision"]
@@ -357,10 +364,162 @@ def future_video(args, sc, frames, per_step=4):
     print(f"wrote {args.out}")
 
 
-def legend_future(img, y):
+def floor_plate(frames, fmasks, every=4):
+    """The empty floor: per-pixel median over the frames where no object (or its shadow) covers the pixel."""
+    idx = range(0, len(frames), every)
+    stack = np.stack([frames[i] for i in idx]).astype(np.float32)
+    for k, i in enumerate(idx):
+        for rle in fmasks[i].values():
+            stack[k][cv2.dilate(rle_decode(rle).astype(np.uint8), np.ones((25, 25), np.uint8)) > 0] = np.nan
+    holes = np.isnan(stack).all(0).any(-1)
+    plate = np.nan_to_num(np.nanmedian(stack, axis=0)).astype(np.uint8)
+    return cv2.inpaint(plate, holes.astype(np.uint8), 5, cv2.INPAINT_TELEA) if holes.any() else plate
+
+
+def erase(frame, masks, removed, plate):
+    """Paint the floor plate over the removed objects and their shadows, never over the objects that stay."""
+    m = np.zeros(frame.shape[:2], np.uint8)
+    for s in removed:
+        if s in masks:
+            m |= rle_decode(masks[s]).astype(np.uint8)
+    if not m.any():
+        return frame
+    m = cv2.dilate(m, np.ones((21, 21), np.uint8)).astype(np.float32)
+    keep = np.zeros_like(m)
+    for s, rle in masks.items():
+        if s not in removed:
+            keep = np.maximum(keep, rle_decode(rle).astype(np.float32))
+    a = (cv2.GaussianBlur(m, (11, 11), 0) * (1 - cv2.dilate(keep, np.ones((3, 3), np.uint8))))[..., None]
+    return (frame * (1 - a) + plate * a).astype(np.uint8)
+
+
+def whatif_video(args, sc, frames, per_step=2):
+    """Observed frames 0-31 with the removed objects erased, then the frozen frame 31 with the counterfactual forecast."""
+    objects, fmasks, removed, min_area = sc.objects, sc.fmasks, args.remove, sc.cfg["min_area"]
+    stay = [s for s in range(len(objects)) if s not in removed]
+    colour = [COLOURS.get(o.get("color"), WHITE) for o in objects]
+    scale = np.array([W_PX, H_PX])
+    real = observed_tracks(sc.d, min_area)
+    real_xy, real_vis = real[0] * scale, real[2]
+    xy, area, vis, z = rollout(sc.model, sc.mu, sc.sd, sc.d, min_area, removed=removed, return_latents=True)
+    pred_xy, T = xy * scale, len(xy)
+    r = np.sqrt(np.maximum(area, 0) * PATCH_PX / np.pi)
+    res = sc.what_if_remove(removed)
+    gone = " and the ".join(res["removed"])
+    hits = []  # (pair, step): the answer's collisions that the forecast places after frame 32
+    if sc.head is not None:
+        lg = head_logits(sc.head, z, xy, area, vis, True)
+        pair_idx = {tuple(p): i for i, p in enumerate(PAIRS.tolist())}
+        for e in res["collisions_without_them"]:
+            j = pair_idx[tuple(e["objects"])]
+            if lg[CTX:, j].max() > sc.thr:
+                hits.append((tuple(e["objects"]), CTX + int(lg[CTX:, j].argmax())))
+    else:  # distance rule: first predicted contact of each pair
+        for a in stay:
+            for b in stay:
+                close = [t for t in range(CTX, T) if a < b and vis[t, a] and vis[t, b] and
+                         np.linalg.norm(pred_xy[t, a] - pred_xy[t, b]) < C * (r[t, a] + r[t, b])]
+                if close:
+                    hits.append(((a, b), close[0]))
+    question = args.question or f"What if the {gone} were removed?"
+    answer = [f"Without the {gone}:"] + [f"+ new: {e['description']}" for e in res["newly_happen"]]
+    answer += [f"- no longer: {e['description']}" for e in res["no_longer_happen"]]
+    if len(answer) == 1:
+        answer.append("no change in which objects collide")
+    plate = floor_plate(frames, fmasks)
+    n_obs, n_all = CTX * STEP, len(frames)
+    W, H = W_PX * SCALE, H_PX * SCALE
+
+    def chrome(img, items, frame_no, future):
+        y0 = H - 8
+        cv2.rectangle(img, (0, y0), (W, H), (60, 60, 66), -1)
+        cv2.rectangle(img, (0, y0), (W * n_obs // n_all, H), (50, 115, 255), -1)
+        if future:
+            cv2.rectangle(img, (W * n_obs // n_all, y0), (W * frame_no // n_all, H), (255, 210, 90), -1)
+        x = W * frame_no // n_all
+        cv2.rectangle(img, (x - 2, y0 - 4), (x + 2, H), WHITE, -1)
+        phase = f"FORECAST without the {gone}" if future else f"OBSERVED, the {gone} erased"
+        items.append(((12, 12), f"{phase}   frame {frame_no:3d}", F_BOLD,
+                      (255, 210, 90) if future else (120, 170, 255), "lt", True))
+        items.append(((16, H + 26), question, F_BOLD, WHITE, "lm", False))
+        items += legend_future(img, H + 72, ("observed path", "forecast without it", "forecast object",
+                                             "forecast collision"))
+        return text_layer(img, items)
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    with av.open(args.out, "w") as out:
+        st = out.add_stream("libx264", rate=args.fps)
+        st.width, st.height, st.pix_fmt = W, H + BAR, "yuv420p"
+        st.options = {"crf": "18"}
+
+        def emit(img):
+            for pkt in st.encode(av.VideoFrame.from_ndarray(img, format="rgb24")):
+                out.mux(pkt)
+
+        def observed(fi):
+            return erase(np.ascontiguousarray(frames[fi]), fmasks[fi], removed, plate)
+
+        for fi in range(0, n_obs, 2):  # what the model sees: the real frames without the removed objects
+            t = fi // STEP
+            img = np.zeros((H + BAR, W, 3), np.uint8)
+            img[:H] = cv2.resize(observed(fi), (W, H), interpolation=cv2.INTER_CUBIC)
+            img[H:] = DARK
+            items = []
+            for s in stay:
+                if s not in fmasks[fi]:
+                    continue
+                m = rle_decode(fmasks[fi][s]).astype(np.uint8)
+                cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+                cv2.drawContours(img, [c * SCALE for c in cnts], -1, colour[s], 2, cv2.LINE_AA)
+                ys, xs = np.nonzero(m)
+                lx = min(max(int(xs.mean() * SCALE), 90), W - 90)
+                items.append(((lx, max(int(ys.min() * SCALE) - 8, 52)), sc.name(s), F_LABEL, colour[s], "mb", True))
+                draw_path(img, [p for k, p in enumerate(real_xy[: t + 1, s]) if real_vis[k, s]], colour[s])
+            emit(chrome(img, items, fi, False))
+
+        # SAM masks exist on even frames only: freeze on the last observed frame that has them
+        frozen = (cv2.resize(observed(n_obs - 2), (W, H), interpolation=cv2.INTER_CUBIC) * 0.55).astype(np.uint8)
+        for k in range(1, (T - CTX) * per_step + 1):  # the forecast, interpolated inside each 4-frame step
+            u = CTX - 1 + k / per_step  # in steps; CTX - 1 is the last observed step
+            i0 = min(int(u), T - 2)
+            img = np.zeros((H + BAR, W, 3), np.uint8)
+            img[:H], img[H:] = frozen, DARK
+            items = []
+            for s in stay:
+                draw_path(img, [p for kk, p in enumerate(real_xy[:CTX, s]) if real_vis[kk, s]], colour[s])
+                if not vis[min(int(u) + 1, T - 1), s]:
+                    continue
+                draw_path(img, pred_xy[CTX - 1:int(u) + 1, s], colour[s], dotted=True)
+                p = pred_xy[i0, s] + (u - i0) * (pred_xy[i0 + 1, s] - pred_xy[i0, s])
+                cv2.circle(img, pt(p), int(r[i0 + 1, s] * SCALE), colour[s], 3, cv2.LINE_AA)
+                items.append(((int(p[0] * SCALE), max(int((p[1] - r[i0 + 1, s]) * SCALE) - 8, 52)), sc.name(s),
+                              F_LABEL, colour[s], "mb", True))
+            for (a, b), t_hit in hits:
+                if u >= t_hit:
+                    mid = pt((pred_xy[t_hit, a] + pred_xy[t_hit, b]) / 2)
+                    cv2.drawMarker(img, mid, (0, 0, 0), cv2.MARKER_STAR, 40, 7, cv2.LINE_AA)
+                    cv2.drawMarker(img, mid, WHITE, cv2.MARKER_STAR, 40, 3, cv2.LINE_AA)
+            img = chrome(img, items, min(int(round(u * STEP)) + STEP - 1, n_all - 1), True)
+            emit(img)
+
+        img[:H] = (img[:H] * 0.3).astype(np.uint8)
+        lines = [l for a in answer for l in textwrap.wrap(a, 80, subsequent_indent="    ")]
+        y = H // 2 - 17 * len(lines)
+        cv2.rectangle(img, (50, y - 70), (W - 50, y + 34 * len(lines) + 10), DARK, -1)
+        cv2.rectangle(img, (50, y - 70), (W - 50, y + 34 * len(lines) + 10), (255, 210, 90), 2)
+        items = [((W // 2, y - 36), "ObjectJEPA answer", F_BIG, (255, 210, 90), "mm", False)]
+        items += [((80, y + 8 + 34 * i), l, F_TEXT if i else F_BOLD, WHITE, "lm", False) for i, l in enumerate(lines)]
+        img = text_layer(img, items)
+        for _ in range(int(args.hold * args.fps)):
+            emit(img)
+        for pkt in st.encode():
+            out.mux(pkt)
+    print(f"wrote {args.out}")
+
+
+def legend_future(img, y, labels=("actual path", "forecast path", "forecast object", "forecast collision")):
     x, items = 16, []
-    for kind, label in (("line", "actual path"), ("dots", "forecast path"),
-                        ("ring", "forecast object"), ("star", "forecast collision")):
+    for kind, label in zip(("line", "dots", "ring", "star"), labels):
         c = (200, 200, 200)
         if kind == "line":
             cv2.line(img, (x, y), (x + 34, y), c, 3, cv2.LINE_AA)

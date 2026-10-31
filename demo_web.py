@@ -7,7 +7,8 @@ Same agent and tools as demo_live.py (agent.answer unchanged): each tool call an
 streamed to the page (demo_web.html) as server-sent events. After the answer, the page plays the
 matching forecast clip from visualize.py if one was rendered (<video>_whatif_remove<slot>_half.mp4,
 <video>_next_half.mp4). The server listens on 127.0.0.1 only and every request needs the random
-token in the printed URL. The Muse Spark backend reads META_API_KEY from the environment only.
+token in the printed URL (set DEMO_TOKEN to keep the same one across restarts). The Muse Spark
+backend reads META_API_KEY from the environment only.
 """
 import argparse
 import glob
@@ -76,7 +77,8 @@ class Demo:
             elif name == "what_if_remove" and len(a.get("objects", [])) == 1:
                 s = int(a["objects"][0])
                 f, cap = f"{self.args.video}_whatif_remove{s}_half.mp4", (f"Forecast without the {self.scene.name(s)}",
-                                                                          "solid = real paths, dots = forecast, the removed object is a ghost")
+                                                                          "it is erased from the video; rings = forecast objects, "
+                                                                          "star = forecast collision")
             else:
                 continue
             return (f, cap) if os.path.exists(os.path.join(self.args.clips, f)) else None
@@ -205,7 +207,7 @@ if __name__ == "__main__":
     args = ap.parse_args()
 
     demo = Demo(args)
-    token = secrets.token_urlsafe(9)
+    token = os.environ.get("DEMO_TOKEN") or secrets.token_urlsafe(9)  # DEMO_TOKEN keeps the URL across restarts
     page = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo_web.html"), "rb").read()
     server = ThreadingHTTPServer(("127.0.0.1", args.port), handler(demo, token, page))
     print(f"Ready. Open http://localhost:{args.port}/?t={token}")

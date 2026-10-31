@@ -77,6 +77,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--meta); outl
 .call .tool { color: var(--built); font-weight: 600; }
 .call .args, .call .secs { color: var(--muted); }
 .res { margin: -4px 0 0 18px; display: flex; flex-direction: column; gap: 3px; font-size: 15px; }
+.res .rname { font: 500 13px/1.4 var(--mono); color: var(--meta); }
 .res .new { color: var(--built); font-weight: 600; }
 .res .gone { color: var(--muted); text-decoration: line-through; }
 .res .dim { color: var(--muted); }
@@ -163,6 +164,7 @@ function sentence(d) { return esc(d.charAt(0).toUpperCase() + d.slice(1)); }
 
 function renderResult(name, r) {
   const box = el("div", "res");
+  box.appendChild(el("div", "rname", "← " + esc(name)));  // which tool this result is from (calls can come in pairs)
   if (r && r.error) { box.appendChild(el("div", "err", esc(r.error))); return box; }
   if (name === "describe_objects") {
     const o = el("div", "objs");
