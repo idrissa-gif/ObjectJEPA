@@ -342,7 +342,7 @@ def future_video(args, sc, frames, per_step=4):
             emit(chrome(img, items, n_real - 1 + int(round(u * STEP)), True))
 
         answer = ["Forecast after the end of the video (predict_future):"]
-        answer += [f"{e['rank']}. {e['description']}  (score {e['score']:.2f})" for e in ranking[:3]] or ["no collision"]
+        answer += [f"{e['rank']}. {e['description']}  (score {e['score']:.2f})" for e in ranking[:3] if e["score"] >= 0.01] or ["no collision"]
         img[:H] = (img[:H] * 0.3).astype(np.uint8)
         y = H // 2 - 17 * len(answer)
         cv2.rectangle(img, (50, y - 70), (W - 50, y + 34 * len(answer) + 10), DARK, -1)
