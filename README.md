@@ -118,9 +118,9 @@ How the "what next" column was fixed (reported in full): in the first run, `pred
 
 | File | Role |
 |---|---|
-| `extract_features.py` | Stage 1. Reads CLEVRER `.mp4`s, cuts context/target clip pairs, encodes each separately with V-JEPA 2, pools patch tokens to a grid, writes one `.pt` per video. `--shard/--num_shards` runs one process per GPU. |
+| `extract_features.py` | Stage 1. Reads CLEVRER `.mp4`s, cuts context/target clip pairs, encodes each separately with V-JEPA 2, pools patch tokens to a grid, writes one `.pt` per video. `--shard/--num_shards` splits the videos across parallel processes. |
 | `train_predictor.py` | Stage 2. Transformer predictor, L1 loss in normalised latent space, DDP via `torchrun`. Prints baselines every epoch. Saves `predictor_best.pt` and `history.json`. |
-| `run.sh` | Download → extract on 2 GPUs → train on 2 GPUs. |
+| `run.sh` | Download → feature extraction → predictor training. |
 | `sam_masks.py` | Stage 3. SAM 3 object masks and tracks for each video. |
 | `extract_object_features.py` | Stage 3. Pools V-JEPA 2 patch tokens inside each object mask → one latent per object (CLEVRER or SAM masks). |
 | `train_object_predictor.py` | Stage 3. Transformer predictor over object latents and positions. |
@@ -132,11 +132,12 @@ How the "what next" column was fixed (reported in full): in the first run, `pred
 | `agent_tools.py` | Stage 4. Local tools for the agent: `describe_objects`, `observed_collisions`, `what_if_remove`, `predict_future`. |
 | `agent.py` | Stage 4. Agent loop. `--backend offline` (rule-based, no API) or `--backend chat` (any OpenAI-compatible endpoint, e.g. Muse Spark). |
 | `demo_live.py` | Live demo: asks the agent one or more questions (`--qid 14 13`) and prints each tool call and result as it happens, then checks the answer against CLEVRER. `--offline` for no API call. |
+| `demo_web.py` + `demo_web.html` | The same live demo in the browser: pick one of the video's questions or type your own, watch each tool call and result stream in, then the forecast clip plays. Prints a local URL with an access token. `--offline` for no API call. |
 | `visualize.py` | Demo videos: observed, predicted, what-if (`--remove`) and after the end of the video (`--future`), with object labels and the answer. |
 
 ## Setup and running
 
-Requirements: Python 3.10+, PyTorch with CUDA, `transformers>=4.53`, `av`, `numpy` (and `scikit-learn` for the learned update). Tested on 2× RTX A6000 (48 GB).
+Requirements: Python 3.10+, PyTorch, `transformers>=4.53`, `av`, `numpy` (and `scikit-learn` for the learned update).
 
 ```bash
 pip install torch torchvision "transformers>=4.53" av numpy
@@ -160,7 +161,7 @@ All code in this repository was written during the event (first commit Oct 27, 2
 - the feature extraction pipeline (separate context/target encoding, full-frame resize, pooling, sharding) and the frame-level latent predictor with its baselines;
 - the object stage: SAM 3 mask extraction (`sam_masks.py`), per-object V-JEPA 2 latents and the object predictor;
 - the "what if" rollout and collision read-out (`whatif.py`), the learned collision head (`collision_head.py`) and what-if update (`whatif_update.py`), the "what will happen next" forecast (`predict_next.py`), the agent tools (colour, shape and material from pixels) and the agent loop with the Muse Spark backend;
-- the evaluation (baselines, sign test, SAM vs ground-truth masks) and the demo renderer (`visualize.py`).
+- the evaluation (baselines, sign test, SAM vs ground-truth masks), the demo renderer (`visualize.py`) and the live demos (`demo_live.py` in the terminal, `demo_web.py` in the browser).
 
 Used as-is, not built here: the pretrained V-JEPA 2 and SAM 3 weights (loaded through Hugging Face `transformers`), the Muse Spark model through the Meta Model API, and the CLEVRER dataset.
 

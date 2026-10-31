@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ObjectJEPA Live Demo</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;600&family=IBM+Plex+Mono:wght@500&display=swap">
+<style>
+/* Served by demo_web.py. Left: the scene (real video, then the forecast). Right: question, live tool trace, answer.
+   Same dark look as the ObjectJEPA slides: orange = built during the hackathon, blue = Meta models. */
+:root {
+  --bg: #12161C;
+  --panel: #1B212A;
+  --line: #2A323D;
+  --fg: #EEF0EC;
+  --muted: #A9B3BF;
+  --built: #F5A04A;
+  --meta: #8FB2F5;
+  --good: #7BD88F;
+  --bad: #FF7A7A;
+  --display: 'Space Grotesk', 'Helvetica Neue', Arial, sans-serif;
+  --body: 'IBM Plex Sans', 'Helvetica Neue', Arial, sans-serif;
+  --mono: 'IBM Plex Mono', ui-monospace, Menlo, Consolas, monospace;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--fg); font: 16px/1.45 var(--body); display: flex; flex-direction: column;
+       padding: 20px max(16px, 2vw); gap: 18px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 20px; }
+.brand { font: 700 28px/1 var(--display); letter-spacing: -0.5px; }
+.brand span { color: var(--built); }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 14px; color: var(--muted); margin-left: auto; }
+.dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: 0; }
+.grid { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 20px; }
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } body { height: auto; } }
+.col { min-height: 0; display: flex; flex-direction: column; gap: 14px; }
+.tabs { display: flex; gap: 8px; }
+.tab { font: 600 15px/1 var(--body); color: var(--muted); background: transparent; border: 1px solid var(--line);
+       border-radius: 8px; padding: 9px 14px; cursor: pointer; }
+.tab[aria-selected="true"] { color: var(--bg); background: var(--fg); border-color: var(--fg); }
+.tab:disabled { opacity: .35; cursor: default; }
+.tab.fresh { border-color: var(--built); color: var(--built); }
+.stage { flex: 1; min-height: 260px; background: #000; border-radius: 12px; display: flex; align-items: center;
+         justify-content: center; overflow: hidden; }
+.stage video { width: 100%; height: 100%; object-fit: contain; display: block; }
+.caption { font-size: 14px; color: var(--muted); margin: 0; }
+.caption b { color: var(--fg); font-weight: 600; }
+.ask { display: flex; flex-direction: column; gap: 10px; }
+.label { font: 700 13px/1 var(--display); letter-spacing: 2.5px; text-transform: uppercase; color: var(--muted); }
+.qs { display: flex; flex-direction: column; gap: 8px; }
+.q { text-align: left; font: 15px/1.35 var(--body); color: var(--fg); background: var(--panel); border: 1px solid var(--line);
+     border-radius: 10px; padding: 10px 12px; cursor: pointer; display: flex; gap: 10px; align-items: baseline; }
+.q:hover:not(:disabled) { border-color: var(--muted); }
+.q:disabled { opacity: .5; cursor: default; }
+.q.on { border-color: var(--built); }
+.kind { flex: none; font: 600 12px/1 var(--mono); color: var(--built); text-transform: uppercase; letter-spacing: .5px; }
+.own { display: flex; gap: 8px; }
+.own input { flex: 1; min-width: 0; font: 15px var(--body); color: var(--fg); background: var(--panel); border: 1px solid var(--line);
+             border-radius: 10px; padding: 10px 12px; }
+.own button { font: 600 15px var(--body); color: var(--bg); background: var(--built); border: 0; border-radius: 10px;
+              padding: 10px 16px; cursor: pointer; }
+.own button:disabled { opacity: .5; cursor: default; }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--meta); outline-offset: 2px; }
+.trace { flex: 1; min-height: 120px; overflow-y: auto; background: var(--panel); border-radius: 12px; padding: 14px 16px;
+         display: flex; flex-direction: column; gap: 10px; }
+.empty { color: var(--muted); margin: auto 0; }
+.qtitle { font: 700 19px/1.3 var(--display); }
+.opts { margin: 4px 0 0; padding-left: 0; list-style: none; color: var(--muted); font-size: 15px; }
+.who { color: var(--meta); font-weight: 600; }
+.thinking { color: var(--muted); }
+.thinking::after { content: "…"; animation: blink 1s steps(2) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .thinking::after { animation: none; } }
+.call { font: 500 14px/1.4 var(--mono); }
+.call .tool { color: var(--built); font-weight: 600; }
+.call .args, .call .secs { color: var(--muted); }
+.res { margin: -4px 0 0 18px; display: flex; flex-direction: column; gap: 3px; font-size: 15px; }
+.res .new { color: var(--built); font-weight: 600; }
+.res .gone { color: var(--muted); text-decoration: line-through; }
+.res .dim { color: var(--muted); }
+.objs { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+.rank { display: grid; grid-template-columns: minmax(0, 1fr) 90px 42px; gap: 10px; align-items: center; }
+.rank .bar { height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; }
+.rank .bar i { display: block; height: 100%; background: var(--muted); }
+.rank.top { color: var(--built); font-weight: 600; }
+.rank.top .bar i { background: var(--built); }
+.rank .sc { font: 500 13px var(--mono); color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+.answer { border-top: 1px solid var(--line); padding-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.answer h3 { margin: 0; font: 700 17px var(--display); }
+.opt { display: grid; grid-template-columns: 22px 42px minmax(0, 1fr); gap: 8px; align-items: baseline; }
+.mark.ok { color: var(--good); font-weight: 700; }
+.mark.ko { color: var(--bad); font-weight: 700; }
+.yn { font: 600 13px var(--mono); text-transform: uppercase; }
+.yn.yes { color: var(--fg); }
+.yn.no { color: var(--muted); }
+.score { font-weight: 600; }
+.foot { font-size: 13px; color: var(--muted); }
+.err { color: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">Object<span>JEPA</span></div>
+  <div class="legend">
+    <span><i class="dot" style="background: var(--built)"></i>built in the hackathon: world model, collision head, tools</span>
+    <span><i class="dot" style="background: var(--meta)"></i>Meta models: V-JEPA 2, SAM 3, Muse Spark</span>
+  </div>
+</header>
+
+<div class="grid">
+  <div class="col">
+    <div class="tabs" role="tablist">
+      <button class="tab" id="tab-real" role="tab" aria-selected="true">Real video</button>
+      <button class="tab" id="tab-fc" role="tab" aria-selected="false" disabled>Forecast</button>
+    </div>
+    <div class="stage">
+      <video id="real" autoplay muted loop playsinline></video>
+      <video id="fc" muted playsinline controls hidden></video>
+    </div>
+    <p class="caption" id="cap"><b id="vname">…</b> · held out, never used in training · objects found by SAM 3, no ground truth</p>
+  </div>
+
+  <div class="col">
+    <div class="ask">
+      <div class="label">Ask a question about this video</div>
+      <div class="qs" id="qs"></div>
+      <form class="own" id="own">
+        <input id="free" placeholder="Or type your own, e.g. What happens if the green sphere is removed?" autocomplete="off">
+        <button id="go">Ask</button>
+      </form>
+    </div>
+    <div class="trace" id="trace"><p class="empty">Pick a question. <span class="who" id="who">Muse Spark</span> will call the world-model tools, and each call shows up here as it happens.</p></div>
+  </div>
+</div>
+
+<script>
+const T = new URLSearchParams(location.search).get("t") || "";
+const $ = id => document.getElementById(id);
+const el = (tag, cls, html) => { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; };
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const SW = {gray: "#8a8a8a", red: "#c03a3a", blue: "#3b5bdb", green: "#2f8a2f", brown: "#8a5a2b",
+            purple: "#8e44c0", cyan: "#2fc4c4", yellow: "#e6d23a"};
+const KIND = {counterfactual: "what if", predictive: "what next"};
+let label = "Muse Spark", busy = false, info = null;
+
+function show(which) {
+  const real = which === "real";
+  $("real").hidden = !real; $("fc").hidden = real;
+  $("tab-real").setAttribute("aria-selected", String(real));
+  $("tab-fc").setAttribute("aria-selected", String(!real));
+  if (real) { $("fc").pause(); $("real").play().catch(() => {}); }
+  else { $("real").pause(); $("tab-fc").classList.remove("fresh"); }
+}
+$("tab-real").onclick = () => show("real");
+$("tab-fc").onclick = () => { show("fc"); $("fc").play().catch(() => {}); };
+
+function add(node) { const t = $("trace"); t.appendChild(node); t.scrollTop = t.scrollHeight; return node; }
+function stopThinking() { document.querySelectorAll(".thinking").forEach(n => n.remove()); }
+function sentence(d) { return esc(d.charAt(0).toUpperCase() + d.slice(1)); }
+
+function renderResult(name, r) {
+  const box = el("div", "res");
+  if (r && r.error) { box.appendChild(el("div", "err", esc(r.error))); return box; }
+  if (name === "describe_objects") {
+    const o = el("div", "objs");
+    r.forEach(x => o.appendChild(el("span", "", `<i class="sw" style="background:${SW[x.color] || "#666"}"></i>${esc(x.description)}`)));
+    box.appendChild(o);
+  } else if (name === "observed_collisions") {
+    (r.length ? r : [{description: "no collisions"}]).forEach(e => box.appendChild(el("div", "", "• " + sentence(e.description))));
+  } else if (name === "what_if_remove") {
+    const fresh = new Set(r.newly_happen.map(e => e.objects.join("-")));
+    box.appendChild(el("div", "dim", "removed: " + esc(r.removed.join(", ") || "nothing")));
+    r.collisions_without_them.forEach(e => box.appendChild(fresh.has(e.objects.join("-"))
+      ? el("div", "new", "+ NEW " + sentence(e.description)) : el("div", "", "• still: " + esc(e.description))));
+    r.no_longer_happen.forEach(e => box.appendChild(el("div", "gone", "– " + sentence(e.description))));
+  } else if (name === "predict_future") {
+    const shown = r.after_the_video.filter(e => e.score >= 0.01).slice(0, 5);
+    if (!shown.length) box.appendChild(el("div", "dim", "no collision expected"));
+    shown.forEach(e => box.appendChild(el("div", "rank" + (e.rank === 1 ? " top" : ""),
+      `<span>${e.rank}. ${sentence(e.description)}</span><span class="bar"><i style="width:${Math.round(e.score * 100)}%"></i></span><span class="sc">${e.score.toFixed(2)}</span>`)));
+  } else {
+    box.appendChild(el("div", "dim", esc(JSON.stringify(r))));
+  }
+  return box;
+}
+
+function renderAnswer(ev, choices) {
+  stopThinking();
+  const box = el("div", "answer");
+  box.appendChild(el("h3", "", `<span class="who">${esc(label)}</span> answers`));
+  if (ev.answers) {
+    let ok = 0;
+    ev.answers.forEach((yes, i) => {
+      const right = yes === ev.truth[i]; ok += right;
+      box.appendChild(el("div", "opt", `<span class="mark ${right ? "ok" : "ko"}">${right ? "✓" : "✗"}</span>` +
+        `<span class="yn ${yes ? "yes" : "no"}">${yes ? "yes" : "no"}</span><span>${i}. ${esc(choices[i])}</span>`));
+    });
+    box.appendChild(el("div", "foot", `<span class="score">${ok} / ${ev.answers.length}</span> options match the CLEVRER ground truth`));
+  } else {
+    box.appendChild(el("div", "", esc(ev.text).replace(/\n/g, "<br>")));
+  }
+  if (ev.usd != null) box.appendChild(el("div", "foot", `${ev.tokens_in.toLocaleString()} tokens in, ${ev.tokens_out.toLocaleString()} out · $${ev.usd.toFixed(3)}`));
+  add(box);
+}
+
+function setBusy(b) {
+  busy = b;
+  document.querySelectorAll(".q, #go, #free").forEach(n => n.disabled = b);
+}
+
+function ask(params, chip) {
+  if (busy) return;
+  setBusy(true);
+  document.querySelectorAll(".q").forEach(n => n.classList.toggle("on", n === chip));
+  $("trace").innerHTML = "";
+  show("real"); $("tab-fc").disabled = true; $("fc").removeAttribute("src");
+  let choices = null;
+  const src = new EventSource(`/api/ask?t=${encodeURIComponent(T)}&${params}`);
+  const end = () => { src.close(); stopThinking(); setBusy(false); };
+  src.onmessage = m => {
+    const ev = JSON.parse(m.data);
+    if (ev.type === "question") {
+      choices = ev.choices;
+      const q = el("div", "", `<div class="qtitle">${esc(ev.question)}</div>`);
+      if (choices) { const ol = el("ul", "opts"); choices.forEach((c, i) => ol.appendChild(el("li", "", `${i}. ${esc(c)}`))); q.appendChild(ol); }
+      add(q);
+    } else if (ev.type === "thinking") {
+      stopThinking(); add(el("div", "thinking", `<span class="who">${esc(label)}</span> is thinking`));
+    } else if (ev.type === "call") {
+      stopThinking();
+      const a = Object.keys(ev.arguments).length ? " " + esc(JSON.stringify(ev.arguments)) : "";
+      add(el("div", "call", `→ <span class="tool">${esc(ev.name)}</span><span class="args">${a}</span> <span class="secs">(${ev.seconds} s)</span>`));
+    } else if (ev.type === "result") {
+      stopThinking(); add(renderResult(ev.name, ev.result));
+    } else if (ev.type === "answer") {
+      renderAnswer(ev, choices);
+    } else if (ev.type === "clip") {
+      const v = $("fc");
+      v.src = ev.src + `?t=${encodeURIComponent(T)}`;
+      v.onloadedmetadata = () => { v.currentTime = ev.start || 0; };
+      $("tab-fc").disabled = false; $("tab-fc").classList.add("fresh");
+      $("cap").innerHTML = `<b>${esc(ev.caption)}</b> · ${esc(ev.legend)} · half speed`;
+      setTimeout(() => { show("fc"); v.play().catch(() => {}); }, 900);
+    } else if (ev.type === "error") {
+      add(el("div", "err", "Error: " + esc(ev.message)));
+    } else if (ev.type === "done") {
+      end();
+    }
+  };
+  src.onerror = end;  // never let EventSource reconnect: that would ask the question again
+}
+
+$("own").onsubmit = e => { e.preventDefault(); const q = $("free").value.trim(); if (q) ask("q=" + encodeURIComponent(q), null); };
+$("tab-real").addEventListener("click", () => {
+  if (info) $("cap").innerHTML = `<b>${esc(info.video)}</b> · held out, never used in training · objects found by SAM 3, no ground truth`;
+});
+
+fetch(`/api/info?t=${encodeURIComponent(T)}`).then(r => r.json()).then(d => {
+  info = d; label = d.label === "muse-spark-1.3" ? "Muse Spark" : d.label;
+  $("who").textContent = label; $("vname").textContent = d.video;
+  $("real").src = `/media/video?t=${encodeURIComponent(T)}`;
+  d.questions.forEach(q => {
+    const b = el("button", "q", `<span class="kind">${KIND[q.type] || q.type}</span><span>${esc(q.question)}</span>`);
+    b.onclick = () => ask("qid=" + q.id, b);
+    $("qs").appendChild(b);
+  });
+}).catch(() => add(el("div", "err", "Could not reach demo_web.py. Is it still running?")));
+</script>
+</body>
+</html>
