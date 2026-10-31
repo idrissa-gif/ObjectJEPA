@@ -13,8 +13,8 @@ Also reported (stricter, not part of the official criterion):
   copy_clip : tgt[k] = ctx[k], i.e. replay the context clip step by step
               (V-JEPA 2 features carry a within-clip time-position signal)
 
-One GPU : python train_predictor.py --features feats
-Two GPUs: torchrun --nproc_per_node=2 train_predictor.py --features feats
+One process : python train_predictor.py --features feats
+N processes : torchrun --nproc_per_node=N train_predictor.py --features feats   (DDP, one per device)
 """
 import argparse
 import glob

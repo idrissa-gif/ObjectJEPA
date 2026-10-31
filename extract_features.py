@@ -10,9 +10,9 @@ Output: one .pt file per video with
   ctx: [S, T', P, D] float16   (S = clip pairs, T' = 8, P = pool*pool, D = 1024)
   tgt: [S, T', P, D] float16
 
-Two GPUs: run one process per card, each takes half the videos:
-  CUDA_VISIBLE_DEVICES=0 python extract_features.py ... --shard 0 --num_shards 2 &
-  CUDA_VISIBLE_DEVICES=1 python extract_features.py ... --shard 1 --num_shards 2 &
+Parallel extraction: run N processes (one per device), each takes 1/N of the videos:
+  CUDA_VISIBLE_DEVICES=0 python extract_features.py ... --shard 0 --num_shards N &
+  CUDA_VISIBLE_DEVICES=1 python extract_features.py ... --shard 1 --num_shards N &   # and so on
 """
 import argparse
 import glob
