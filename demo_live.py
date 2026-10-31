@@ -47,10 +47,11 @@ def show_result(name, res):
         for e in res["no_longer_happen"]:
             print(paint(f"    − GONE  {e['description']}", "dim"))
     elif name == "predict_future":
-        for e in res["after_the_video"][:5]:
+        shown = [e for e in res["after_the_video"] if e["score"] >= 0.01][:5]  # the agent gets every pair
+        for e in shown:
             line = f"    {e['rank']}. {e['description']}  (score {e['score']:.2f})"
             print(paint(line, "orange", "bold") if e["rank"] == 1 else line)
-        if not res["after_the_video"]:
+        if not shown:
             print("    (no collision expected)")
     else:
         print(f"    {json.dumps(res)}")
