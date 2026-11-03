@@ -145,6 +145,8 @@ bash run.sh 500      # smoke run on 500 videos
 bash run.sh 0        # full ~10k training videos
 ```
 
+**Pretrained weights** (object predictor, collision head, what-if update) are on Hugging Face: [Idrissa242/ObjectJEPA](https://huggingface.co/Idrissa242/ObjectJEPA). `hf download Idrissa242/ObjectJEPA --local-dir weights`, then pass `--ckpt weights/predictor --head weights/collision_head --update weights/whatif_update` to `agent.py`, `demo_live.py`, `demo_web.py` or `visualize.py`.
+
 To run inside a conda env, use `CONDA_ENV=myenv bash run.sh`. Data goes to `~/objectjepa_data` (override with `DATA=/path bash run.sh`). The CLEVRER train zip is 12.4 GB; plan for ~60 GB including features.
 
 ### Notes
